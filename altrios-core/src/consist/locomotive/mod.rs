@@ -2,6 +2,7 @@
 
 pub mod battery_electric_loco;
 pub mod conventional_loco;
+pub mod conventional_aess_loco;
 pub mod hybrid_loco;
 pub mod loco_sim;
 pub mod locomotive_model;
@@ -16,6 +17,9 @@ pub use crate::consist::locomotive::battery_electric_loco::{
     RGWDBStateBELHistoryVec,
 };
 pub use crate::consist::locomotive::conventional_loco::ConventionalLoco;
+pub use crate::consist::locomotive::conventional_aess_loco::{
+    ConventionalAESSLoco, AESSController, AESSControllerState, AESSControllerStateHistoryVec,
+};
 pub use crate::consist::locomotive::hybrid_loco::{
     HybridLoco, HybridPowertrainControls, RESGreedyWithDynamicBuffers, RGWDBState,
     RGWDBStateHistoryVec,
