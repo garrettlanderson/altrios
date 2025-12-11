@@ -59,6 +59,13 @@ pub struct FuelConverter {
     /// Coolant setpoint temperature (default 190°F = 87.78°C)
     #[serde(default)]
     pub coolant_setpoint_temp: Option<si::ThermodynamicTemperature>,
+    /// Engine controller parameters
+    /// Minimum power threshold below which engine should turn off (to avoid inefficient operation)
+    #[serde(default)]
+    pub engine_off_below_power: Option<si::Power>,
+    /// Time delay before shutting off engine when power is below threshold
+    #[serde(default)]
+    pub engine_off_delay: Option<si::Time>,
 }
 
 #[pyo3_api]
@@ -248,6 +255,27 @@ impl FuelConverter {
         engine_on: bool,
         assert_limits: bool,
     ) -> anyhow::Result<()> {
+        // Engine controller logic - determine if engine should be off
+        if let (Some(power_threshold), Some(off_delay)) = 
+            (self.engine_off_below_power, self.engine_off_delay) {
+            
+            if pwr_out_req < power_threshold {
+                // Power is below threshold, increment time
+                self.state.time_below_threshold.increment(dt, || format_dbg!())?;
+            } else {
+                // Power is above threshold, reset timer
+                self.state.time_below_threshold.update(si::Time::ZERO, || format_dbg!())?;
+            }
+            
+            // Determine if engine should be off based on delay
+            let should_be_off = *self.state.time_below_threshold.get_fresh(|| format_dbg!())? >= off_delay;
+            self.state.engine_should_be_off.update(should_be_off, || format_dbg!())?;
+        } else {
+            // Controller not configured, engine follows external engine_on signal
+            self.state.time_below_threshold.update(si::Time::ZERO, || format_dbg!())?;
+            self.state.engine_should_be_off.update(false, || format_dbg!())?;
+        }
+        
         if engine_on {
             self.state.time_on.increment(dt, || format_dbg!())?;
         } else {
@@ -415,14 +443,14 @@ impl FuelConverter {
             
             // Update thermal states
             self.state.current_temp.update(clamped_temp, || format_dbg!())?;
-            self.state.heat_rejection_rate.update(heat_rejected_power, || format_dbg!())?;
+            self.state.pwr_heat_rejection.update(heat_rejected_power, || format_dbg!())?;
         } else {
             // Thermal model not configured, set default values
             self.state.current_temp.update(
                 self.ambient_temp.unwrap_or(si::ThermodynamicTemperature::ZERO), 
                 || format_dbg!()
             )?;
-            self.state.heat_rejection_rate.update(si::Power::ZERO, || format_dbg!())?;
+            self.state.pwr_heat_rejection.update(si::Power::ZERO, || format_dbg!())?;
         }
         
         Ok(())
@@ -485,9 +513,14 @@ pub struct FuelConverterState {
     /// Current engine temperature
     pub current_temp: TrackedState<si::ThermodynamicTemperature>,
     /// Heat rejection rate (power being rejected to coolant)
-    pub heat_rejection_rate: TrackedState<si::Power>,
+    pub pwr_heat_rejection: TrackedState<si::Power>,
     /// Total rejected heat (cumulative)
-    pub total_rejected_heat: TrackedState<si::Energy>,
+    pub energy_heat_rejection: TrackedState<si::Energy>,
+    /// Engine controller states
+    /// Time spent below power threshold
+    pub time_below_threshold: TrackedState<si::Time>,
+    /// Engine should be off based on controller logic
+    pub engine_should_be_off: TrackedState<bool>,
 }
 
 #[pyo3_api]
@@ -512,8 +545,10 @@ impl Default for FuelConverterState {
             engine_on: TrackedState::new(true),
             time_on: Default::default(),
             current_temp: Default::default(),
-            heat_rejection_rate: Default::default(),
-            total_rejected_heat: Default::default(),
+            pwr_heat_rejection: Default::default(),
+            energy_heat_rejection: Default::default(),
+            time_below_threshold: Default::default(),
+            engine_should_be_off: TrackedState::new(false),
         }
     }
 }
