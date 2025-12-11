@@ -46,6 +46,26 @@ pub struct FuelConverter {
     /// Custom vector of [Self::state]
     #[serde(default)]
     pub history: FuelConverterStateHistoryVec, // TODO: spec out fuel tank size and track kg of fuel
+    /// Thermal model parameters
+    /// Ambient temperature for thermal model
+    #[serde(default)]
+    pub ambient_temp: Option<si::ThermodynamicTemperature>,
+    /// Initial engine temperature
+    #[serde(default)]
+    pub initial_engine_temp: Option<si::ThermodynamicTemperature>,
+    /// Engine mass for thermal model
+    #[serde(default)]
+    pub engine_mass: Option<si::Mass>,
+    /// Coolant setpoint temperature (default 190°F = 87.78°C)
+    #[serde(default)]
+    pub coolant_setpoint_temp: Option<si::ThermodynamicTemperature>,
+    /// Engine controller parameters
+    /// Minimum power threshold below which engine should turn off (to avoid inefficient operation)
+    #[serde(default)]
+    pub engine_off_below_power: Option<si::Power>,
+    /// Time delay before shutting off engine when power is below threshold
+    #[serde(default)]
+    pub engine_off_delay: Option<si::Time>,
 }
 
 #[pyo3_api]
@@ -235,6 +255,27 @@ impl FuelConverter {
         engine_on: bool,
         assert_limits: bool,
     ) -> anyhow::Result<()> {
+        // Engine controller logic - determine if engine should be off
+        if let (Some(power_threshold), Some(off_delay)) = 
+            (self.engine_off_below_power, self.engine_off_delay) {
+            
+            if pwr_out_req < power_threshold {
+                // Power is below threshold, increment time
+                self.state.time_below_threshold.increment(dt, || format_dbg!())?;
+            } else {
+                // Power is above threshold, reset timer
+                self.state.time_below_threshold.update(si::Time::ZERO, || format_dbg!())?;
+            }
+            
+            // Determine if engine should be off based on delay
+            let should_be_off = *self.state.time_below_threshold.get_fresh(|| format_dbg!())? >= off_delay;
+            self.state.engine_should_be_off.update(should_be_off, || format_dbg!())?;
+        } else {
+            // Controller not configured, engine follows external engine_on signal
+            self.state.time_below_threshold.update(si::Time::ZERO, || format_dbg!())?;
+            self.state.engine_should_be_off.update(false, || format_dbg!())?;
+        }
+        
         if engine_on {
             self.state.time_on.increment(dt, || format_dbg!())?;
         } else {
@@ -354,6 +395,64 @@ impl FuelConverter {
                 )
             )
         );
+
+        // Thermal model calculations
+        if let (Some(engine_mass), Some(ambient_temp), Some(coolant_setpoint)) = 
+            (self.engine_mass, self.ambient_temp, self.coolant_setpoint_temp) {
+            
+            // Specific heat capacity of steel: approximately 500 J/(kg·K)
+            let cp_steel = 500.0 * uc::M2PS2K;
+            
+            // Half of the waste heat goes into the engine thermal mass
+            let pwr_loss = *self.state.pwr_loss.get_fresh(|| format_dbg!())?;
+            let heat_to_engine = pwr_loss * 0.5;
+            
+            // Get current temperature (initialize to initial_engine_temp if not set)
+            let current_temp = if *self.state.current_temp.get_stale(|| format_dbg!())? == si::ThermodynamicTemperature::ZERO {
+                self.initial_engine_temp.unwrap_or(ambient_temp)
+            } else {
+                *self.state.current_temp.get_stale(|| format_dbg!())?
+            };
+            
+            // Calculate temperature change: dT = (Q * dt) / (m * Cp)
+            // Q (power) * dt (time) = Energy
+            // Energy / (mass * specific_heat) = TemperatureInterval
+            let energy_to_engine = heat_to_engine * dt;
+            let thermal_capacity = engine_mass * cp_steel;
+            let temp_increase_interval = energy_to_engine / thermal_capacity;
+            
+            // Work with raw values since we need to add a TemperatureInterval to a ThermodynamicTemperature
+            // Both use Kelvin as the base unit
+            let current_temp_kelvin = current_temp.get::<si::kelvin>();
+            let temp_increase_kelvin = temp_increase_interval.value; // Raw value in Kelvin
+            let new_temp_kelvin = current_temp_kelvin + temp_increase_kelvin;
+            let new_temp = si::ThermodynamicTemperature::new::<si::kelvin>(new_temp_kelvin);
+            
+            // Clamp temperature at coolant setpoint
+            let clamped_temp = new_temp.min(coolant_setpoint);
+            
+            // Heat rejection occurs when temperature exceeds setpoint
+            let heat_rejected_power = if new_temp > coolant_setpoint {
+                // All excess heat is rejected
+                let excess_temp_kelvin = new_temp.get::<si::kelvin>() - coolant_setpoint.get::<si::kelvin>();
+                let excess_temp_interval = excess_temp_kelvin * uc::KELVIN_INT;
+                heat_to_engine + excess_temp_interval * thermal_capacity / dt
+            } else {
+                si::Power::ZERO
+            };
+            
+            // Update thermal states
+            self.state.current_temp.update(clamped_temp, || format_dbg!())?;
+            self.state.pwr_heat_rejection.update(heat_rejected_power, || format_dbg!())?;
+        } else {
+            // Thermal model not configured, set default values
+            self.state.current_temp.update(
+                self.ambient_temp.unwrap_or(si::ThermodynamicTemperature::ZERO), 
+                || format_dbg!()
+            )?;
+            self.state.pwr_heat_rejection.update(si::Power::ZERO, || format_dbg!())?;
+        }
+        
         Ok(())
     }
 
@@ -410,6 +509,18 @@ pub struct FuelConverterState {
     pub engine_on: TrackedState<bool>,
     /// elapsed time since engine was turned on
     pub time_on: TrackedState<si::Time>,
+    /// Thermal model states
+    /// Current engine temperature
+    pub current_temp: TrackedState<si::ThermodynamicTemperature>,
+    /// Heat rejection rate (power being rejected to coolant)
+    pub pwr_heat_rejection: TrackedState<si::Power>,
+    /// Total rejected heat (cumulative)
+    pub energy_heat_rejection: TrackedState<si::Energy>,
+    /// Engine controller states
+    /// Time spent below power threshold
+    pub time_below_threshold: TrackedState<si::Time>,
+    /// Engine should be off based on controller logic
+    pub engine_should_be_off: TrackedState<bool>,
 }
 
 #[pyo3_api]
@@ -433,6 +544,11 @@ impl Default for FuelConverterState {
             energy_idle_fuel: Default::default(),
             engine_on: TrackedState::new(true),
             time_on: Default::default(),
+            current_temp: Default::default(),
+            pwr_heat_rejection: Default::default(),
+            energy_heat_rejection: Default::default(),
+            time_below_threshold: Default::default(),
+            engine_should_be_off: TrackedState::new(false),
         }
     }
 }
@@ -564,5 +680,125 @@ mod tests {
         let eta_range = 0.2;
 
         eta_test_body!(fc, eta_max, eta_min, eta_range);
+    }
+
+    #[test]
+    fn test_thermal_model_temperature_increase() {
+        let mut fc = test_fc();
+        // Configure thermal model
+        // Convert Celsius to Kelvin: K = C + 273.15
+        fc.ambient_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(20.0 + uc::CELSIUS_TO_KELVIN));  // 20°C
+        fc.initial_engine_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(20.0 + uc::CELSIUS_TO_KELVIN));
+        fc.engine_mass = Some(5000.0 * uc::KG);  // 5000 kg engine
+        fc.coolant_setpoint_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(87.78 + uc::CELSIUS_TO_KELVIN));  // 190°F = 87.78°C
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+        
+        fc.set_cur_pwr_out_max(None, uc::S * 1.0).unwrap();
+
+        // Run with high power to generate heat
+        fc.solve_energy_consumption(uc::W * 2_000e3, uc::S * 1.0, true, false)
+            .unwrap();
+        
+        // Temperature should increase from ambient
+        let temp = *fc.state.current_temp.get_fresh(|| format_dbg!()).unwrap();
+        assert!(temp > fc.ambient_temp.unwrap());
+    }
+
+    #[test]
+    fn test_thermal_model_temperature_clamp() {
+        let mut fc = test_fc();
+        // Configure thermal model with small mass for quick heating
+        fc.ambient_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(20.0 + uc::CELSIUS_TO_KELVIN));
+        fc.initial_engine_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(87.0 + uc::CELSIUS_TO_KELVIN));  // Close to setpoint
+        fc.engine_mass = Some(100.0 * uc::KG);  // Small mass
+        fc.coolant_setpoint_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(87.78 + uc::CELSIUS_TO_KELVIN));
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+
+        // Run multiple times with high power
+        for i in 0..10 {
+            fc.set_cur_pwr_out_max(None, uc::S * 10.0).unwrap();
+            fc.solve_energy_consumption(uc::W * 2_000e3, uc::S * 10.0, true, false)
+                .unwrap();
+            fc.set_cumulative(uc::S * 10.0, || format_dbg!()).unwrap();
+            
+            // Check temperature at end
+            if i == 9 {
+                let temp = *fc.state.current_temp.get_fresh(|| format_dbg!()).unwrap();
+                assert!(temp <= fc.coolant_setpoint_temp.unwrap() * 1.001);  // Allow small tolerance
+            }
+            
+            fc.check_and_reset(|| format_dbg!()).unwrap();
+            fc.step(|| format_dbg!()).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_engine_controller_turns_off() {
+        let mut fc = test_fc();
+        // Configure engine controller
+        fc.engine_off_below_power = Some(500e3 * uc::W);  // 500 kW threshold
+        fc.engine_off_delay = Some(5.0 * uc::S);  // 5 second delay
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+        
+        fc.set_cur_pwr_out_max(None, uc::S * 3.0).unwrap();
+
+        // Run with low power for less than delay
+        fc.solve_energy_consumption(uc::W * 100e3, uc::S * 3.0, true, false)
+            .unwrap();
+        fc.set_cumulative(uc::S * 3.0, || format_dbg!()).unwrap();
+        
+        // Engine should not be marked for shutdown yet
+        assert!(!*fc.state.engine_should_be_off.get_fresh(|| format_dbg!()).unwrap());
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+
+        fc.set_cur_pwr_out_max(None, uc::S * 3.0).unwrap();
+        // Run with low power for additional time to exceed delay
+        fc.solve_energy_consumption(uc::W * 100e3, uc::S * 3.0, true, false)
+            .unwrap();
+        fc.set_cumulative(uc::S * 3.0, || format_dbg!()).unwrap();
+        
+        // Engine should now be marked for shutdown
+        assert!(*fc.state.engine_should_be_off.get_fresh(|| format_dbg!()).unwrap());
+    }
+
+    #[test]
+    fn test_engine_controller_resets_timer() {
+        let mut fc = test_fc();
+        // Configure engine controller
+        fc.engine_off_below_power = Some(500e3 * uc::W);
+        fc.engine_off_delay = Some(5.0 * uc::S);
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+        
+        fc.set_cur_pwr_out_max(None, uc::S * 3.0).unwrap();
+
+        // Run with low power
+        fc.solve_energy_consumption(uc::W * 100e3, uc::S * 3.0, true, false)
+            .unwrap();
+        fc.set_cumulative(uc::S * 3.0, || format_dbg!()).unwrap();
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+        
+        fc.set_cur_pwr_out_max(None, uc::S * 1.0).unwrap();
+        // Run with high power to reset timer
+        fc.solve_energy_consumption(uc::W * 1_000e3, uc::S * 1.0, true, false)
+            .unwrap();
+        fc.set_cumulative(uc::S * 1.0, || format_dbg!()).unwrap();
+        
+        // Timer should be reset
+        assert_eq!(
+            *fc.state.time_below_threshold.get_fresh(|| format_dbg!()).unwrap(),
+            si::Time::ZERO
+        );
     }
 }

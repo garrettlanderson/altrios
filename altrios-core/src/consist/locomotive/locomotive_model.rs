@@ -4,6 +4,7 @@ use super::*;
 #[allow(clippy::large_enum_variant)]
 pub enum PowertrainType {
     ConventionalLoco(ConventionalLoco),
+    ConventionalAESSLoco(ConventionalAESSLoco),
     HybridLoco(Box<HybridLoco>),
     BatteryElectricLoco(BatteryElectricLoco),
     DummyLoco(DummyLoco),
@@ -13,6 +14,7 @@ impl Init for PowertrainType {
     fn init(&mut self) -> Result<(), Error> {
         match self {
             Self::ConventionalLoco(l) => l.init()?,
+            Self::ConventionalAESSLoco(l) => l.init()?,
             Self::HybridLoco(l) => l.init()?,
             Self::BatteryElectricLoco(l) => l.init()?,
             Self::DummyLoco(_) => {}
@@ -33,6 +35,13 @@ impl LocoTrait for PowertrainType {
     ) -> anyhow::Result<()> {
         match self {
             PowertrainType::ConventionalLoco(conv) => conv.set_curr_pwr_max_out(
+                pwr_aux,
+                elev_and_temp,
+                train_mass_for_loco,
+                train_speed,
+                dt,
+            ),
+            PowertrainType::ConventionalAESSLoco(conv_aess) => conv_aess.set_curr_pwr_max_out(
                 pwr_aux,
                 elev_and_temp,
                 train_mass_for_loco,
@@ -66,6 +75,7 @@ impl LocoTrait for PowertrainType {
     fn get_energy_loss(&self) -> anyhow::Result<si::Energy> {
         match self {
             PowertrainType::ConventionalLoco(conv) => conv.get_energy_loss(),
+            PowertrainType::ConventionalAESSLoco(conv_aess) => conv_aess.get_energy_loss(),
             PowertrainType::HybridLoco(hel) => hel.get_energy_loss(),
             PowertrainType::BatteryElectricLoco(bel) => bel.get_energy_loss(),
             PowertrainType::DummyLoco(dummy) => dummy.get_energy_loss(),
@@ -78,6 +88,9 @@ impl SaveState for PowertrainType {
         match self {
             PowertrainType::ConventionalLoco(conv) => {
                 conv.save_state(|| format!("{}\n{}", loc(), format_dbg!()))?
+            }
+            PowertrainType::ConventionalAESSLoco(conv_aess) => {
+                conv_aess.save_state(|| format!("{}\n{}", loc(), format_dbg!()))?
             }
             PowertrainType::HybridLoco(hel) => {
                 hel.save_state(|| format!("{}\n{}", loc(), format_dbg!()))?
@@ -99,6 +112,9 @@ impl Step for PowertrainType {
             PowertrainType::ConventionalLoco(conv) => {
                 conv.step(|| format!("{}\n{}", loc(), format_dbg!()))?
             }
+            PowertrainType::ConventionalAESSLoco(conv_aess) => {
+                conv_aess.step(|| format!("{}\n{}", loc(), format_dbg!()))?
+            }
             PowertrainType::HybridLoco(hel) => {
                 hel.step(|| format!("{}\n{}", loc(), format_dbg!()))?
             }
@@ -118,6 +134,9 @@ impl CheckAndResetState for PowertrainType {
         match self {
             PowertrainType::ConventionalLoco(conv) => {
                 conv.check_and_reset(|| format!("{}\n{}", loc(), format_dbg!()))?
+            }
+            PowertrainType::ConventionalAESSLoco(conv_aess) => {
+                conv_aess.check_and_reset(|| format!("{}\n{}", loc(), format_dbg!()))?
             }
             PowertrainType::HybridLoco(hel) => {
                 hel.check_and_reset(|| format!("{}\n{}", loc(), format_dbg!()))?
@@ -139,6 +158,9 @@ impl SetCumulative for PowertrainType {
     fn set_cumulative<F: Fn() -> String>(&mut self, dt: si::Time, loc: F) -> anyhow::Result<()> {
         match self {
             Self::ConventionalLoco(loco) => {
+                loco.set_cumulative(dt, || format!("{}\n{}", loc(), format_dbg!()))
+            }
+            Self::ConventionalAESSLoco(loco) => {
                 loco.set_cumulative(dt, || format!("{}\n{}", loc(), format_dbg!()))
             }
             Self::HybridLoco(loco) => {
@@ -197,6 +219,7 @@ impl std::string::ToString for PowertrainType {
     fn to_string(&self) -> String {
         let s = match self {
             PowertrainType::ConventionalLoco(_) => stringify!(ConventionalLoco),
+            PowertrainType::ConventionalAESSLoco(_) => stringify!(ConventionalAESSLoco),
             PowertrainType::HybridLoco(_) => stringify!(HybridLoco),
             PowertrainType::BatteryElectricLoco(_) => stringify!(BatteryElectricLoco),
             PowertrainType::DummyLoco(_) => stringify!(DummyLoco),
@@ -729,6 +752,7 @@ impl Mass for Locomotive {
     fn derived_mass(&self) -> anyhow::Result<Option<si::Mass>> {
         match &self.loco_type {
             PowertrainType::ConventionalLoco(conv) => conv.mass(),
+            PowertrainType::ConventionalAESSLoco(conv_aess) => conv_aess.mass(),
             PowertrainType::HybridLoco(hev) => hev.mass(),
             PowertrainType::BatteryElectricLoco(bev) => bev.mass(),
             PowertrainType::DummyLoco(_) => Ok(None),
@@ -738,6 +762,7 @@ impl Mass for Locomotive {
     fn expunge_mass_fields(&mut self) {
         match &mut self.loco_type {
             PowertrainType::ConventionalLoco(conv) => conv.expunge_mass_fields(),
+            PowertrainType::ConventionalAESSLoco(conv_aess) => conv_aess.expunge_mass_fields(),
             PowertrainType::HybridLoco(hev) => hev.expunge_mass_fields(),
             PowertrainType::BatteryElectricLoco(bev) => bev.expunge_mass_fields(),
             PowertrainType::DummyLoco(_) => {}
@@ -868,6 +893,14 @@ impl Locomotive {
                 loco.gen.save_interval = save_interval;
                 loco.edrv.save_interval = save_interval;
             }
+            PowertrainType::ConventionalAESSLoco(loco) => {
+                loco.fc.save_interval = save_interval;
+                loco.gen.save_interval = save_interval;
+                loco.edrv.save_interval = save_interval;
+                loco.starter_battery.save_interval = save_interval;
+                loco.air_brake.save_interval = save_interval;
+                loco.aess_controller.save_interval = save_interval;
+            }
             PowertrainType::HybridLoco(loco) => {
                 loco.fc.save_interval = save_interval;
                 loco.gen.save_interval = save_interval;
@@ -885,6 +918,7 @@ impl Locomotive {
     pub fn fuel_converter(&self) -> Option<&FuelConverter> {
         match &self.loco_type {
             PowertrainType::ConventionalLoco(loco) => Some(&loco.fc),
+            PowertrainType::ConventionalAESSLoco(loco) => Some(&loco.fc),
             PowertrainType::HybridLoco(loco) => Some(&loco.fc),
             PowertrainType::BatteryElectricLoco(_) => None,
             PowertrainType::DummyLoco(_) => None,
@@ -894,6 +928,7 @@ impl Locomotive {
     pub fn fuel_converter_mut(&mut self) -> Option<&mut FuelConverter> {
         match &mut self.loco_type {
             PowertrainType::ConventionalLoco(loco) => Some(&mut loco.fc),
+            PowertrainType::ConventionalAESSLoco(loco) => Some(&mut loco.fc),
             PowertrainType::HybridLoco(loco) => Some(&mut loco.fc),
             PowertrainType::BatteryElectricLoco(_) => None,
             PowertrainType::DummyLoco(_) => None,
@@ -903,6 +938,10 @@ impl Locomotive {
     pub fn set_fuel_converter(&mut self, fc: FuelConverter) -> Result<()> {
         match &mut self.loco_type {
             PowertrainType::ConventionalLoco(loco) => {
+                loco.fc = fc;
+                Ok(())
+            }
+            PowertrainType::ConventionalAESSLoco(loco) => {
                 loco.fc = fc;
                 Ok(())
             }
@@ -918,6 +957,7 @@ impl Locomotive {
     pub fn generator(&self) -> Option<&Generator> {
         match &self.loco_type {
             PowertrainType::ConventionalLoco(loco) => Some(&loco.gen),
+            PowertrainType::ConventionalAESSLoco(loco) => Some(&loco.gen),
             PowertrainType::HybridLoco(loco) => Some(&loco.gen),
             PowertrainType::BatteryElectricLoco(_) => None,
             PowertrainType::DummyLoco(_) => None,
@@ -927,6 +967,7 @@ impl Locomotive {
     pub fn generator_mut(&mut self) -> Option<&mut Generator> {
         match &mut self.loco_type {
             PowertrainType::ConventionalLoco(loco) => Some(&mut loco.gen),
+            PowertrainType::ConventionalAESSLoco(loco) => Some(&mut loco.gen),
             PowertrainType::HybridLoco(loco) => Some(&mut loco.gen),
             PowertrainType::BatteryElectricLoco(_) => None,
             PowertrainType::DummyLoco(_) => None,
@@ -936,6 +977,10 @@ impl Locomotive {
     pub fn set_generator(&mut self, gen: Generator) -> Result<()> {
         match &mut self.loco_type {
             PowertrainType::ConventionalLoco(loco) => {
+                loco.gen = gen;
+                Ok(())
+            }
+            PowertrainType::ConventionalAESSLoco(loco) => {
                 loco.gen = gen;
                 Ok(())
             }
@@ -951,6 +996,7 @@ impl Locomotive {
     pub fn reversible_energy_storage(&self) -> Option<&ReversibleEnergyStorage> {
         match &self.loco_type {
             PowertrainType::ConventionalLoco(_) => None,
+            PowertrainType::ConventionalAESSLoco(_) => None,
             PowertrainType::HybridLoco(loco) => Some(&loco.res),
             PowertrainType::BatteryElectricLoco(loco) => Some(&loco.res),
             PowertrainType::DummyLoco(_) => None,
@@ -960,6 +1006,7 @@ impl Locomotive {
     pub fn reversible_energy_storage_mut(&mut self) -> Option<&mut ReversibleEnergyStorage> {
         match &mut self.loco_type {
             PowertrainType::ConventionalLoco(_) => None,
+            PowertrainType::ConventionalAESSLoco(_) => None,
             PowertrainType::HybridLoco(loco) => Some(&mut loco.res),
             PowertrainType::BatteryElectricLoco(loco) => Some(&mut loco.res),
             PowertrainType::DummyLoco(_) => None,
@@ -970,6 +1017,10 @@ impl Locomotive {
         match &mut self.loco_type {
             PowertrainType::ConventionalLoco(_) => {
                 bail!("Conventional has no ReversibleEnergyStorage.")
+            }
+            PowertrainType::ConventionalAESSLoco(loco) => {
+                loco.starter_battery = res;
+                Ok(())
             }
             PowertrainType::HybridLoco(loco) => {
                 loco.res = res;
@@ -986,6 +1037,7 @@ impl Locomotive {
     pub fn electric_drivetrain(&self) -> Option<&ElectricDrivetrain> {
         match &self.loco_type {
             PowertrainType::ConventionalLoco(loco) => Some(&loco.edrv),
+            PowertrainType::ConventionalAESSLoco(loco) => Some(&loco.edrv),
             PowertrainType::HybridLoco(loco) => Some(&loco.edrv),
             PowertrainType::BatteryElectricLoco(loco) => Some(&loco.edrv),
             PowertrainType::DummyLoco(_) => None,
@@ -995,6 +1047,10 @@ impl Locomotive {
     pub fn set_electric_drivetrain(&mut self, edrv: ElectricDrivetrain) -> Result<()> {
         match &mut self.loco_type {
             PowertrainType::ConventionalLoco(loco) => {
+                loco.edrv = edrv;
+                Ok(())
+            }
+            PowertrainType::ConventionalAESSLoco(loco) => {
                 loco.edrv = edrv;
                 Ok(())
             }
@@ -1017,6 +1073,20 @@ impl Locomotive {
         if let (Some(baseline), Some(ballast)) = (self.baseline_mass, self.ballast_mass) {
             match self.loco_type {
                 PowertrainType::ConventionalLoco(_) => {
+                    if let (Some(fc), Some(gen)) = (
+                        self.fuel_converter().unwrap().mass()?,
+                        self.generator().unwrap().mass()?,
+                    ) {
+                        Ok(Some(fc + gen + baseline + ballast))
+                    } else {
+                        bail!(
+                            "Locomotive fields baseline and ballast masses are both specified\n{}\n{}",
+                            "so `fc` and `gen` masses must also be specified.",
+                            format_dbg!()
+                        )
+                    }
+                }
+                PowertrainType::ConventionalAESSLoco(_) => {
                     if let (Some(fc), Some(gen)) = (
                         self.fuel_converter().unwrap().mass()?,
                         self.generator().unwrap().mass()?,
@@ -1066,6 +1136,19 @@ impl Locomotive {
         } else if self.baseline_mass.is_none() && self.ballast_mass.is_none() {
             match self.loco_type {
                 PowertrainType::ConventionalLoco(_) => {
+                    if self.fuel_converter().unwrap().mass()?.is_none()
+                        && self.generator().unwrap().mass()?.is_none()
+                    {
+                        Ok(None)
+                    } else {
+                        bail!(
+                            "Locomotive fields baseline and ballast masses are both `None`\n{}\n{}",
+                            "so `fc` and `gen` masses must also be `None`.",
+                            format_dbg!()
+                        )
+                    }
+                }
+                PowertrainType::ConventionalAESSLoco(_) => {
                     if self.fuel_converter().unwrap().mass()?.is_none()
                         && self.generator().unwrap().mass()?.is_none()
                     {
@@ -1155,6 +1238,16 @@ impl Locomotive {
                 //             .get_fresh(|| format_dbg!())?,
                 //     || format_dbg!(),
                 // )?;
+            }
+            PowertrainType::ConventionalAESSLoco(loco) => {
+                loco.solve_energy_consumption(
+                    pwr_out_req,
+                    dt,
+                    *self.state.pwr_aux.get_fresh(|| format_dbg!())?,
+                    self.assert_limits,
+                    0.0,  // brake_demand - could be passed in if needed
+                )
+                .with_context(|| format_dbg!("ConventionalAESSLoco"))?;
             }
             PowertrainType::HybridLoco(loco) => {
                 loco.solve_energy_consumption(
@@ -1308,6 +1401,13 @@ impl LocoTrait for Locomotive {
         )?;
         match &self.loco_type {
             PowertrainType::ConventionalLoco(loco) => {
+                set_pwr_lims(&mut self.state, &loco.edrv)?;
+                assert_eq!(
+                    *self.state.pwr_regen_max.get_fresh(|| format_dbg!())?,
+                    si::Power::ZERO
+                );
+            }
+            PowertrainType::ConventionalAESSLoco(loco) => {
                 set_pwr_lims(&mut self.state, &loco.edrv)?;
                 assert_eq!(
                     *self.state.pwr_regen_max.get_fresh(|| format_dbg!())?,
