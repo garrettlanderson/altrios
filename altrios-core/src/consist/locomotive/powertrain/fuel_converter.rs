@@ -681,4 +681,124 @@ mod tests {
 
         eta_test_body!(fc, eta_max, eta_min, eta_range);
     }
+
+    #[test]
+    fn test_thermal_model_temperature_increase() {
+        let mut fc = test_fc();
+        // Configure thermal model
+        // Convert Celsius to Kelvin: K = C + 273.15
+        fc.ambient_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(20.0 + uc::CELSIUS_TO_KELVIN));  // 20°C
+        fc.initial_engine_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(20.0 + uc::CELSIUS_TO_KELVIN));
+        fc.engine_mass = Some(5000.0 * uc::KG);  // 5000 kg engine
+        fc.coolant_setpoint_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(87.78 + uc::CELSIUS_TO_KELVIN));  // 190°F = 87.78°C
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+        
+        fc.set_cur_pwr_out_max(None, uc::S * 1.0).unwrap();
+
+        // Run with high power to generate heat
+        fc.solve_energy_consumption(uc::W * 2_000e3, uc::S * 1.0, true, false)
+            .unwrap();
+        
+        // Temperature should increase from ambient
+        let temp = *fc.state.current_temp.get_fresh(|| format_dbg!()).unwrap();
+        assert!(temp > fc.ambient_temp.unwrap());
+    }
+
+    #[test]
+    fn test_thermal_model_temperature_clamp() {
+        let mut fc = test_fc();
+        // Configure thermal model with small mass for quick heating
+        fc.ambient_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(20.0 + uc::CELSIUS_TO_KELVIN));
+        fc.initial_engine_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(87.0 + uc::CELSIUS_TO_KELVIN));  // Close to setpoint
+        fc.engine_mass = Some(100.0 * uc::KG);  // Small mass
+        fc.coolant_setpoint_temp = Some(si::ThermodynamicTemperature::new::<si::kelvin>(87.78 + uc::CELSIUS_TO_KELVIN));
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+
+        // Run multiple times with high power
+        for i in 0..10 {
+            fc.set_cur_pwr_out_max(None, uc::S * 10.0).unwrap();
+            fc.solve_energy_consumption(uc::W * 2_000e3, uc::S * 10.0, true, false)
+                .unwrap();
+            fc.set_cumulative(uc::S * 10.0, || format_dbg!()).unwrap();
+            
+            // Check temperature at end
+            if i == 9 {
+                let temp = *fc.state.current_temp.get_fresh(|| format_dbg!()).unwrap();
+                assert!(temp <= fc.coolant_setpoint_temp.unwrap() * 1.001);  // Allow small tolerance
+            }
+            
+            fc.check_and_reset(|| format_dbg!()).unwrap();
+            fc.step(|| format_dbg!()).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_engine_controller_turns_off() {
+        let mut fc = test_fc();
+        // Configure engine controller
+        fc.engine_off_below_power = Some(500e3 * uc::W);  // 500 kW threshold
+        fc.engine_off_delay = Some(5.0 * uc::S);  // 5 second delay
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+        
+        fc.set_cur_pwr_out_max(None, uc::S * 3.0).unwrap();
+
+        // Run with low power for less than delay
+        fc.solve_energy_consumption(uc::W * 100e3, uc::S * 3.0, true, false)
+            .unwrap();
+        fc.set_cumulative(uc::S * 3.0, || format_dbg!()).unwrap();
+        
+        // Engine should not be marked for shutdown yet
+        assert!(!*fc.state.engine_should_be_off.get_fresh(|| format_dbg!()).unwrap());
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+
+        fc.set_cur_pwr_out_max(None, uc::S * 3.0).unwrap();
+        // Run with low power for additional time to exceed delay
+        fc.solve_energy_consumption(uc::W * 100e3, uc::S * 3.0, true, false)
+            .unwrap();
+        fc.set_cumulative(uc::S * 3.0, || format_dbg!()).unwrap();
+        
+        // Engine should now be marked for shutdown
+        assert!(*fc.state.engine_should_be_off.get_fresh(|| format_dbg!()).unwrap());
+    }
+
+    #[test]
+    fn test_engine_controller_resets_timer() {
+        let mut fc = test_fc();
+        // Configure engine controller
+        fc.engine_off_below_power = Some(500e3 * uc::W);
+        fc.engine_off_delay = Some(5.0 * uc::S);
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+        
+        fc.set_cur_pwr_out_max(None, uc::S * 3.0).unwrap();
+
+        // Run with low power
+        fc.solve_energy_consumption(uc::W * 100e3, uc::S * 3.0, true, false)
+            .unwrap();
+        fc.set_cumulative(uc::S * 3.0, || format_dbg!()).unwrap();
+        
+        fc.check_and_reset(|| format_dbg!()).unwrap();
+        fc.step(|| format_dbg!()).unwrap();
+        
+        fc.set_cur_pwr_out_max(None, uc::S * 1.0).unwrap();
+        // Run with high power to reset timer
+        fc.solve_energy_consumption(uc::W * 1_000e3, uc::S * 1.0, true, false)
+            .unwrap();
+        fc.set_cumulative(uc::S * 1.0, || format_dbg!()).unwrap();
+        
+        // Timer should be reset
+        assert_eq!(
+            *fc.state.time_below_threshold.get_fresh(|| format_dbg!()).unwrap(),
+            si::Time::ZERO
+        );
+    }
 }
