@@ -191,7 +191,7 @@ impl AirBrake {
         self.state.current_reservoir_pressure.update(new_pressure, || format_dbg!())?;
         self.state.brake_pipe_pressure.update(brake_pipe_pressure, || format_dbg!())?;
         self.state.compressor_on.update(compressor_on, || format_dbg!())?;
-        self.state.current_compressor_power.update(compressor_power, || format_dbg!())?;
+        self.state.pwr_compressor.update(compressor_power, || format_dbg!())?;
         self.state.total_compressed_air_scf.increment(air_delivered_scf, || format_dbg!())?;
 
         Ok(())
@@ -207,7 +207,7 @@ pub struct AirBrakeState {
     /// iteration counter
     pub i: TrackedState<usize>,
     /// Current compressor power draw
-    pub current_compressor_power: TrackedState<si::Power>,
+    pub pwr_compressor: TrackedState<si::Power>,
     /// Current reservoir pressure
     pub current_reservoir_pressure: TrackedState<si::Pressure>,
     /// Brake pipe pressure
@@ -215,7 +215,7 @@ pub struct AirBrakeState {
     /// Compressor on/off state
     pub compressor_on: TrackedState<bool>,
     /// Total compressor energy consumed
-    pub total_compressor_energy: TrackedState<si::Energy>,
+    pub energy_compressor: TrackedState<si::Energy>,
     /// Total compressed air delivered in standard cubic feet
     pub total_compressed_air_scf: TrackedState<f64>,
 }
@@ -230,11 +230,11 @@ impl Default for AirBrakeState {
     fn default() -> Self {
         Self {
             i: Default::default(),
-            current_compressor_power: Default::default(),
+            pwr_compressor: Default::default(),
             current_reservoir_pressure: Default::default(),
             brake_pipe_pressure: Default::default(),
             compressor_on: TrackedState::new(false),
-            total_compressor_energy: Default::default(),
+            energy_compressor: Default::default(),
             total_compressed_air_scf: Default::default(),
         }
     }
