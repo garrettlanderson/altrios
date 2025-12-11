@@ -93,6 +93,7 @@ impl SolvePower for RESGreedy {
             for loco in loco_vec {
                 loco_pwr_out_vec.push(match &loco.loco_type {
                     PowertrainType::ConventionalLoco(_) => si::Power::ZERO,
+                    PowertrainType::ConventionalAESSLoco(_) => si::Power::ZERO,
                     PowertrainType::HybridLoco(_) => {
                         *loco.state.pwr_out_max.get_fresh(|| format_dbg!())?
                             / *state.pwr_out_max_reves.get_fresh(|| format_dbg!())?
@@ -117,7 +118,11 @@ impl SolvePower for RESGreedy {
             for loco in loco_vec {
                 loco_pwr_out_vec.push( match &loco.loco_type {
                     PowertrainType::ConventionalLoco(_) => {
-*                        loco.state.pwr_out_max.get_fresh(|| format_dbg!())? / *state.pwr_out_max_non_reves.get_fresh(|| format_dbg!())?
+                        *loco.state.pwr_out_max.get_fresh(|| format_dbg!())? / *state.pwr_out_max_non_reves.get_fresh(|| format_dbg!())?
+                            * *state.pwr_out_deficit.get_fresh(|| format_dbg!())?
+                    }
+                    PowertrainType::ConventionalAESSLoco(_) => {
+                        *loco.state.pwr_out_max.get_fresh(|| format_dbg!())? / *state.pwr_out_max_non_reves.get_fresh(|| format_dbg!())?
                             * *state.pwr_out_deficit.get_fresh(|| format_dbg!())?
                     }
                     PowertrainType::HybridLoco(_) => *loco.state.pwr_out_max.get_fresh(|| format_dbg!())?,
@@ -168,6 +173,7 @@ fn get_pwr_regen_vec(
         pwr_regen_vec.push(match &loco.loco_type {
             // no braking power from conventional locos if there is capacity to regen all power
             PowertrainType::ConventionalLoco(_) => si::Power::ZERO,
+            PowertrainType::ConventionalAESSLoco(_) => si::Power::ZERO,
             PowertrainType::HybridLoco(_) => {
                 *loco.state.pwr_regen_max.get_fresh(|| format_dbg!())? * regen_frac
             }
