@@ -1,3 +1,4 @@
+pub mod air_brake;
 pub mod electric_drivetrain;
 pub mod fuel_converter;
 pub mod generator;

@@ -46,6 +46,19 @@ pub struct FuelConverter {
     /// Custom vector of [Self::state]
     #[serde(default)]
     pub history: FuelConverterStateHistoryVec, // TODO: spec out fuel tank size and track kg of fuel
+    /// Thermal model parameters
+    /// Ambient temperature for thermal model
+    #[serde(default)]
+    pub ambient_temp: Option<si::ThermodynamicTemperature>,
+    /// Initial engine temperature
+    #[serde(default)]
+    pub initial_engine_temp: Option<si::ThermodynamicTemperature>,
+    /// Engine mass for thermal model
+    #[serde(default)]
+    pub engine_mass: Option<si::Mass>,
+    /// Coolant setpoint temperature (default 190°F = 87.78°C)
+    #[serde(default)]
+    pub coolant_setpoint_temp: Option<si::ThermodynamicTemperature>,
 }
 
 #[pyo3_api]
@@ -354,6 +367,64 @@ impl FuelConverter {
                 )
             )
         );
+
+        // Thermal model calculations
+        if let (Some(engine_mass), Some(ambient_temp), Some(coolant_setpoint)) = 
+            (self.engine_mass, self.ambient_temp, self.coolant_setpoint_temp) {
+            
+            // Specific heat capacity of steel: approximately 500 J/(kg·K)
+            let cp_steel = 500.0 * uc::M2PS2K;
+            
+            // Half of the waste heat goes into the engine thermal mass
+            let pwr_loss = *self.state.pwr_loss.get_fresh(|| format_dbg!())?;
+            let heat_to_engine = pwr_loss * 0.5;
+            
+            // Get current temperature (initialize to initial_engine_temp if not set)
+            let current_temp = if *self.state.current_temp.get_stale(|| format_dbg!())? == si::ThermodynamicTemperature::ZERO {
+                self.initial_engine_temp.unwrap_or(ambient_temp)
+            } else {
+                *self.state.current_temp.get_stale(|| format_dbg!())?
+            };
+            
+            // Calculate temperature change: dT = (Q * dt) / (m * Cp)
+            // Q (power) * dt (time) = Energy
+            // Energy / (mass * specific_heat) = TemperatureInterval
+            let energy_to_engine = heat_to_engine * dt;
+            let thermal_capacity = engine_mass * cp_steel;
+            let temp_increase_interval = energy_to_engine / thermal_capacity;
+            
+            // Work with raw values since we need to add a TemperatureInterval to a ThermodynamicTemperature
+            // Both use Kelvin as the base unit
+            let current_temp_kelvin = current_temp.get::<si::kelvin>();
+            let temp_increase_kelvin = temp_increase_interval.value; // Raw value in Kelvin
+            let new_temp_kelvin = current_temp_kelvin + temp_increase_kelvin;
+            let new_temp = si::ThermodynamicTemperature::new::<si::kelvin>(new_temp_kelvin);
+            
+            // Clamp temperature at coolant setpoint
+            let clamped_temp = new_temp.min(coolant_setpoint);
+            
+            // Heat rejection occurs when temperature exceeds setpoint
+            let heat_rejected_power = if new_temp > coolant_setpoint {
+                // All excess heat is rejected
+                let excess_temp_kelvin = new_temp.get::<si::kelvin>() - coolant_setpoint.get::<si::kelvin>();
+                let excess_temp_interval = excess_temp_kelvin * uc::KELVIN_INT;
+                heat_to_engine + excess_temp_interval * thermal_capacity / dt
+            } else {
+                si::Power::ZERO
+            };
+            
+            // Update thermal states
+            self.state.current_temp.update(clamped_temp, || format_dbg!())?;
+            self.state.heat_rejection_rate.update(heat_rejected_power, || format_dbg!())?;
+        } else {
+            // Thermal model not configured, set default values
+            self.state.current_temp.update(
+                self.ambient_temp.unwrap_or(si::ThermodynamicTemperature::ZERO), 
+                || format_dbg!()
+            )?;
+            self.state.heat_rejection_rate.update(si::Power::ZERO, || format_dbg!())?;
+        }
+        
         Ok(())
     }
 
@@ -410,6 +481,13 @@ pub struct FuelConverterState {
     pub engine_on: TrackedState<bool>,
     /// elapsed time since engine was turned on
     pub time_on: TrackedState<si::Time>,
+    /// Thermal model states
+    /// Current engine temperature
+    pub current_temp: TrackedState<si::ThermodynamicTemperature>,
+    /// Heat rejection rate (power being rejected to coolant)
+    pub heat_rejection_rate: TrackedState<si::Power>,
+    /// Total rejected heat (cumulative)
+    pub total_rejected_heat: TrackedState<si::Energy>,
 }
 
 #[pyo3_api]
@@ -433,6 +511,9 @@ impl Default for FuelConverterState {
             energy_idle_fuel: Default::default(),
             engine_on: TrackedState::new(true),
             time_on: Default::default(),
+            current_temp: Default::default(),
+            heat_rejection_rate: Default::default(),
+            total_rejected_heat: Default::default(),
         }
     }
 }
