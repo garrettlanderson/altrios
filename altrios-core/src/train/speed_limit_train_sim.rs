@@ -179,7 +179,7 @@ impl SpeedLimitTrainSim {
     ) -> anyhow::Result<()> {
         let network = Vec::<Link>::from_file(network_file_path, false).unwrap();
 
-        self.extend_path(&network, &link_path)?;
+        self.extend_path_tpc(&network, &link_path)?;
         Ok(())
     }
 
@@ -451,7 +451,11 @@ impl SpeedLimitTrainSim {
         self.save_interval
     }
 
-    pub fn extend_path(&mut self, network: &[Link], link_path: &[LinkIdx]) -> anyhow::Result<()> {
+    pub fn extend_path_tpc(
+        &mut self,
+        network: &[Link],
+        link_path: &[LinkIdx],
+    ) -> anyhow::Result<()> {
         self.path_tpc
             .extend(network, link_path)
             .with_context(|| format_dbg!())?;
@@ -587,7 +591,55 @@ impl SpeedLimitTrainSim {
             bail!("Timed path cannot be empty!");
         }
 
+        // Get train length to check if we need additional previous links
+        let train_length = *self.state.length.get_fresh(|| format_dbg!())?;
+        let first_link_idx = timed_path[0].link_idx;
+        let first_link = &network[first_link_idx.idx()];
+
+        // Collect previous links if the train is longer than the first link
+        let mut initial_link_path = Vec::with_capacity(16);
+        if first_link.length < train_length {
+            let mut total_length = first_link.length;
+            let mut current_link_idx = first_link_idx;
+
+            // Keep adding previous links until we have enough length for the train
+            while total_length < train_length {
+                let current_link = &network[current_link_idx.idx()];
+
+                // Get the previous link (prefer idx_prev over idx_prev_alt)
+                let prev_link_idx = if current_link.idx_prev.is_real() {
+                    current_link.idx_prev
+                } else if current_link.idx_prev_alt.is_real() {
+                    current_link.idx_prev_alt
+                } else {
+                    // No more previous links available
+                    bail!(
+                        "Train too long for initial route in walk_timed_path: train length ({:.2} m) exceeds available \
+                        track length ({:.2} m). The first link and its previous links do not \
+                        provide enough length to place the train. Consider reducing train length.",
+                        train_length.get::<si::meter>(),
+                        total_length.get::<si::meter>(),
+                    );
+                };
+
+                let prev_link = &network[prev_link_idx.idx()];
+                total_length += prev_link.length;
+                initial_link_path.push(prev_link_idx);
+                current_link_idx = prev_link_idx;
+            }
+
+            // Reverse the path so it goes from previous links to origin
+            initial_link_path.reverse();
+        }
+
         self.save_state(|| format_dbg!())?;
+
+        // If we have previous links to add, extend the path with them first
+        if !initial_link_path.is_empty() {
+            self.extend_path_tpc(network, &initial_link_path)
+                .with_context(|| format!("{}\nExtending with previous links for train length", format_dbg!()))?;
+        }
+
         let mut idx_prev = 0;
         while idx_prev != timed_path.len() - 1 {
             let mut idx_next = idx_prev + 1;
@@ -597,20 +649,31 @@ impl SpeedLimitTrainSim {
                 idx_next += 1;
             }
             let time_extend = timed_path[idx_next - 1].time;
-            self.extend_path(
+            self.extend_path_tpc(
                 network,
                 &timed_path[idx_prev..idx_next]
                     .iter()
                     .map(|x| x.link_idx)
                     .collect::<Vec<LinkIdx>>(),
-            )?;
+            )
+            .with_context(|| format!("{}\nidx_prev: {idx_prev}", format_dbg!()))?;
             idx_prev = idx_next;
             while *self.state.time.get_fresh(|| format_dbg!())? < time_extend {
-                self.step(|| format_dbg!())?;
+                self.step(|| format_dbg!()).with_context(|| {
+                    format!(
+                        "{}\n`self.state.time`: {:?}\n`time_extend`: {:?}",
+                        format_dbg!(),
+                        self.state.time,
+                        time_extend
+                    )
+                })?;
             }
         }
 
-        self.walk_internal()
+        // Chad thinks this finishes up the last stretch of the timed path but
+        // does not rerun the whole thing
+        self.walk_internal().with_context(|| format_dbg!())?;
+        Ok(())
     }
 
     /// Sets power requirements based on:
