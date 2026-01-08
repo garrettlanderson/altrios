@@ -239,4 +239,6 @@ for item in ACCEPTED_RUST_STRUCTS:
     setattr(getattr(altrios_pyo3, item), "from_pydict", from_pydict)  # noqa: F405
     setattr(getattr(altrios_pyo3, item), "to_dataframe", to_dataframe)  # noqa: F405
 
-setattr(ReversibleEnergyStorage, "from_excel", classmethod(_res_from_excel))  # noqa: F405
+setattr(
+    ReversibleEnergyStorage, "from_excel", classmethod(_res_from_excel)
+)  # noqa: F405
