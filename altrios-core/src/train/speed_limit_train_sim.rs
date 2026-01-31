@@ -637,7 +637,12 @@ impl SpeedLimitTrainSim {
         // If we have previous links to add, extend the path with them first
         if !initial_link_path.is_empty() {
             self.extend_path_tpc(network, &initial_link_path)
-                .with_context(|| format!("{}\nExtending with previous links for train length", format_dbg!()))?;
+                .with_context(|| {
+                    format!(
+                        "{}\nExtending with previous links for train length",
+                        format_dbg!()
+                    )
+                })?;
         }
 
         let mut idx_prev = 0;

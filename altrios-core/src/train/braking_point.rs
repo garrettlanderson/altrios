@@ -36,7 +36,7 @@ pub struct BrakingPoints {
     /// speed limit is 30 mph and `speed_limit_tol` is 10 mph (the default),
     /// then the allowed speed limit when checking is 40 mph
     #[serde(default = "def_speed_lim_tol")]
-    speed_limit_tol: si::Velocity,
+    pub speed_limit_tol: si::Velocity,
 }
 
 fn def_speed_lim_tol() -> si::Velocity {
