@@ -8,6 +8,7 @@ from copy import copy
 
 import altrios as alt
 from altrios.demos import plot_util
+
 sns.set_theme()
 
 
@@ -100,18 +101,10 @@ hel_new_dict["loco_type"]["HybridLoco"]["pt_cntrl"]["RGWDB"] = hel_new_pt_cntrl
 hel_sans_buffers = alt.Locomotive.from_pydict(hel_new_dict)
 
 # construct a vector of one BEL, one HEL, and several conventional locomotives
-loco_vec = (
-    []
-    + [hel.copy()]
-    + [alt.Locomotive.default()] * 1
-)
+loco_vec = [] + [hel.copy()] + [alt.Locomotive.default()] * 1
 
 # construct a vector of one BEL, one HEL, and several conventional locomotives
-loco_vec_sans_buffers = (
-    []
-    + [hel_sans_buffers.copy()]
-    + [alt.Locomotive.default()] * 1
-)
+loco_vec_sans_buffers = [] + [hel_sans_buffers.copy()] + [alt.Locomotive.default()] * 1
 
 # instantiate consist
 print("Building `Consist`")
@@ -159,6 +152,22 @@ train_sim: alt.SpeedLimitTrainSim = tsb.make_speed_limit_train_sim(
     save_interval=SAVE_INTERVAL,
 )
 train_sim.set_save_interval(SAVE_INTERVAL)
+
+# ── Smoothness tuning ───────────────────────────────────────────────
+# 1. Friction brake ramp-up time: default is now 30 s (was 0).
+#    Increase for even gentler braking; decrease for faster response.
+#    train_sim.fric_brake.ramp_up_time_seconds = 45.0
+#
+# 2. Ramp-up anticipation coefficient (0–1).  Higher values cause the
+#    braking curve to start earlier, giving more margin for the slow
+#    brake build-up.  Default is 0.6.
+#    train_sim.fric_brake.ramp_up_coeff_ratio = 0.8
+#
+# 3. Maximum acceleration/deceleration limit [m/s²].  When set, the
+#    applied force is clamped so the train never accelerates or brakes
+#    harder than this value.  Typical freight values: 0.05–0.15 m/s².
+#    train_sim.max_accel_meters_per_second_squared = 0.1
+# ────────────────────────────────────────────────────────────────────
 
 train_sim_sans_buffers: alt.SpeedLimitTrainSim = (
     tsb_sans_buffers.make_speed_limit_train_sim(

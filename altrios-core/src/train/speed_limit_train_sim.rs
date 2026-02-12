@@ -96,6 +96,13 @@ pub struct SpeedLimitTrainSim {
     /// Time-dependent temperature at sea level that can be corrected for
     /// altitude using a standard model
     temp_trace: Option<TemperatureTrace>,
+    /// Optional maximum acceleration/deceleration magnitude limit [m/s²].
+    /// When set, the target force applied to the train is clamped so that
+    /// the resulting acceleration does not exceed this value.  This produces
+    /// smoother speed transitions and less aggressive air-brake applications.
+    /// A typical freight-train value is 0.05–0.15 m/s².
+    #[serde(default)]
+    pub max_accel: Option<si::Acceleration>,
 }
 
 #[pyo3_api]
@@ -234,6 +241,8 @@ pub struct SpeedLimitTrainSimBuilder {
     pub scenario_year: Option<i32>,
     /// Time-dependent temperature at sea level that can be corrected for altitude using a standard model
     pub temp_trace: Option<TemperatureTrace>,
+    /// Optional maximum acceleration/deceleration magnitude limit
+    pub max_accel: Option<si::Acceleration>,
 }
 
 impl From<SpeedLimitTrainSimBuilder> for SpeedLimitTrainSim {
@@ -254,6 +263,7 @@ impl From<SpeedLimitTrainSimBuilder> for SpeedLimitTrainSim {
             simulation_days: value.simulation_days,
             scenario_year: value.scenario_year,
             temp_trace: value.temp_trace,
+            max_accel: value.max_accel,
         }
     }
 }
@@ -733,10 +743,27 @@ impl SpeedLimitTrainSim {
             .speed_target
             .update(speed_target, || format_dbg!())?;
 
-        let f_applied_target = res_net
+        let f_applied_target_raw = res_net
             + self.state.mass_compound().with_context(|| format_dbg!())?
                 * (speed_target - *self.state.speed.get_stale(|| format_dbg!())?)
                 / *self.state.dt.get_fresh(|| format_dbg!())?;
+
+        // If a maximum acceleration limit is configured, clamp the target
+        // force so that the resulting acceleration/deceleration magnitude
+        // does not exceed `max_accel`.  This produces smoother speed
+        // transitions and gentler air-brake applications.
+        let f_applied_target = if let Some(max_accel) = self.max_accel {
+            let mass = self.state.mass_compound().with_context(|| format_dbg!())?;
+            let f_accel_limit = mass * max_accel;
+            // Clamp the *net* (force - resistance) contribution so the
+            // resulting acceleration stays within [-max_accel, +max_accel].
+            // f_applied_target = res_net + mass * a  =>  a = (f_applied_target - res_net) / mass
+            let f_net_raw = f_applied_target_raw - res_net;
+            let f_net_clamped = f_net_raw.max(-f_accel_limit).min(f_accel_limit);
+            res_net + f_net_clamped
+        } else {
+            f_applied_target_raw
+        };
 
         // calculate the max positive tractive effort.  this is the same as set_speed_train_sim
         let pwr_pos_max = self
@@ -1213,6 +1240,7 @@ impl Default for SpeedLimitTrainSim {
             save_interval: None,
             simulation_days: None,
             scenario_year: None,
+            max_accel: None,
         };
         slts.set_save_interval(None);
         slts.init().unwrap();
