@@ -728,7 +728,6 @@ impl TrainSimBuilder {
             simulation_days,
             scenario_year,
             temp_trace,
-            max_accel: None,
         }
         .into())
     }
@@ -788,7 +787,6 @@ impl TrainSimBuilder {
             simulation_days,
             scenario_year,
             temp_trace,
-            max_accel: None,
         };
         Ok((ts.into(), path_tpc, train_res, fric_brake))
     }

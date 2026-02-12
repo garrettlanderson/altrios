@@ -720,7 +720,6 @@ class SpeedLimitTrainSim(SerdeAPI):
     save_interval: Optional[int]
     simulation_days: Optional[int]
     scenario_year: Optional[int]
-    max_accel_meters_per_second_squared: Optional[float]
 
     @classmethod
     def __init__(
