@@ -1,6 +1,7 @@
 use super::environment::TemperatureTrace;
 use super::{braking_point::BrakingPoints, friction_brakes::*, train_imports::*};
 use crate::imports::*;
+use crate::meet_pass::est_times::create_virtual_link;
 use crate::track::link::network::Network;
 use crate::track::{LinkPoint, Location};
 
@@ -598,6 +599,7 @@ impl SpeedLimitTrainSim {
 
         // Collect previous links if the train is longer than the first link
         let mut initial_link_path = Vec::with_capacity(16);
+        let mut virtual_link: Option<Link> = None;
         if first_link.length < train_length {
             let mut total_length = first_link.length;
             let mut current_link_idx = first_link_idx;
@@ -612,14 +614,14 @@ impl SpeedLimitTrainSim {
                 } else if current_link.idx_prev_alt.is_real() {
                     current_link.idx_prev_alt
                 } else {
-                    // No more previous links available
-                    bail!(
-                        "Train too long for initial route in walk_timed_path: train length ({:.2} m) exceeds available \
-                        track length ({:.2} m). The first link and its previous links do not \
-                        provide enough length to place the train. Consider reducing train length.",
-                        train_length.get::<si::meter>(),
-                        total_length.get::<si::meter>(),
-                    );
+                    // No more previous links available -- create a virtual link
+                    let virtual_link_idx = LinkIdx::new(network.len() as u32);
+                    let vlink =
+                        create_virtual_link(&network[current_link_idx.idx()], virtual_link_idx);
+                    total_length += vlink.length;
+                    initial_link_path.push(virtual_link_idx);
+                    virtual_link = Some(vlink);
+                    break;
                 };
 
                 let prev_link = &network[prev_link_idx.idx()];
@@ -636,8 +638,28 @@ impl SpeedLimitTrainSim {
 
         // If we have previous links to add, extend the path with them first
         if !initial_link_path.is_empty() {
-            self.extend_path_tpc(network, &initial_link_path)
-                .with_context(|| format!("{}\nExtending with previous links for train length", format_dbg!()))?;
+            if let Some(ref vlink) = virtual_link {
+                // Create an extended network with the virtual link appended
+                let mut extended_network = network.to_vec();
+                // Update the connecting link's idx_prev to point to the virtual link
+                extended_network[vlink.idx_next.idx()].idx_prev = vlink.idx_curr;
+                extended_network.push(vlink.clone());
+                self.extend_path_tpc(&extended_network, &initial_link_path)
+                    .with_context(|| {
+                        format!(
+                            "{}\nExtending with virtual link for train length",
+                            format_dbg!()
+                        )
+                    })?;
+            } else {
+                self.extend_path_tpc(network, &initial_link_path)
+                    .with_context(|| {
+                        format!(
+                            "{}\nExtending with previous links for train length",
+                            format_dbg!()
+                        )
+                    })?;
+            }
         }
 
         let mut idx_prev = 0;
