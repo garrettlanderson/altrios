@@ -561,12 +561,35 @@ impl SpeedLimitTrainSim {
 
     /// Walks until getting to the end of the path
     fn walk_internal(&mut self) -> anyhow::Result<()> {
+        let mut stall_time = si::Time::ZERO;
+        let mut last_offset = *self.state.offset.get_fresh(|| format_dbg!())?;
         while *self.state.offset.get_fresh(|| format_dbg!())?
             < self.path_tpc.offset_end() - 1000.0 * uc::FT
             || (*self.state.offset.get_fresh(|| format_dbg!())? < self.path_tpc.offset_end()
                 && *self.state.speed.get_fresh(|| format_dbg!())? != si::Velocity::ZERO)
         {
             self.step(|| format_dbg!())?;
+            let cur_offset = *self.state.offset.get_fresh(|| format_dbg!())?;
+            if cur_offset == last_offset
+                && *self.state.speed.get_fresh(|| format_dbg!())? == si::Velocity::ZERO
+            {
+                stall_time += *self.state.dt.get_fresh(|| format_dbg!())?;
+                if stall_time > 3600.0 * uc::S {
+                    let gap_ft =
+                        (self.path_tpc.offset_end() - cur_offset).get::<si::meter>() * 3.28084;
+                    bail!(
+                        "[SLTS] Train stalled in walk_internal for >1h: \
+                         offset={:.1}mi, offset_end={:.1}mi, gap={:.0}ft. \
+                         Train cannot reach end of path.",
+                        cur_offset.get::<si::meter>() / 1609.344,
+                        self.path_tpc.offset_end().get::<si::meter>() / 1609.344,
+                        gap_ft
+                    );
+                }
+            } else {
+                stall_time = si::Time::ZERO;
+                last_offset = cur_offset;
+            }
         }
         Ok(())
     }
@@ -592,78 +615,118 @@ impl SpeedLimitTrainSim {
             bail!("Timed path cannot be empty!");
         }
 
-        // Get train length to check if we need additional previous links
+        // Backward context: when the first timed link is too short relative to
+        // the train length, `recalc_braking_points` (called inside
+        // `extend_path_tpc`) computes a braking curve that walks backward from
+        // `offset_end`.  At each point it calculates
+        // `offset_back = offset - train_length`.  If the path doesn't extend
+        // far enough behind the train's starting position, `offset_back` goes
+        // negative and the simulation panics.
+        //
+        // To fix this we prepend previous links and a virtual link (5 mi flat)
+        // BEFORE the first timed link, then shift the train's starting offset
+        // to the junction between the backward context and the first real link.
+        // This way:
+        //   - The backward context provides enough room for any braking curve.
+        //   - The train never actually steps through the virtual/previous
+        //     links, so no phantom energy is accumulated.
+        //   - History and cumulative state are clean — no walk, no reset needed.
+        //   - The main loop handles the first timed link at idx_prev=0 with
+        //     its original timing constraint, identical to the pre-fix behavior.
+        //
+        // The 2x factor on `train_length` accounts for the braking curve
+        // potentially extending well past the train's back end.
         let train_length = *self.state.length.get_fresh(|| format_dbg!())?;
         let first_link_idx = timed_path[0].link_idx;
         let first_link = &network[first_link_idx.idx()];
 
-        // Collect previous links if the train is longer than the first link
         let mut initial_link_path = Vec::with_capacity(16);
-        let mut virtual_link: Option<Link> = None;
-        if first_link.length < train_length {
-            let mut total_length = first_link.length;
-            let mut current_link_idx = first_link_idx;
+        let mut extended_network: Option<Vec<Link>> = None;
 
-            // Keep adding previous links until we have enough length for the train
-            while total_length < train_length {
+        if first_link.length < train_length * 2.0 {
+            let mut current_link_idx = first_link_idx;
+            let mut total_prev_length = si::Length::ZERO;
+
+            // Collect real previous links
+            loop {
                 let current_link = &network[current_link_idx.idx()];
 
-                // Get the previous link (prefer idx_prev over idx_prev_alt)
                 let prev_link_idx = if current_link.idx_prev.is_real() {
                     current_link.idx_prev
                 } else if current_link.idx_prev_alt.is_real() {
                     current_link.idx_prev_alt
                 } else {
-                    // No more previous links available -- create a virtual link
-                    let virtual_link_idx = LinkIdx::new(network.len() as u32);
-                    let vlink =
-                        create_virtual_link(&network[current_link_idx.idx()], virtual_link_idx);
-                    total_length += vlink.length;
-                    initial_link_path.push(virtual_link_idx);
-                    virtual_link = Some(vlink);
                     break;
                 };
 
                 let prev_link = &network[prev_link_idx.idx()];
-                total_length += prev_link.length;
+                total_prev_length += prev_link.length;
                 initial_link_path.push(prev_link_idx);
                 current_link_idx = prev_link_idx;
+
+                if total_prev_length >= train_length {
+                    break;
+                }
             }
 
-            // Reverse the path so it goes from previous links to origin
+            // Always cap with a virtual link at the very start of the chain.
+            let virtual_link_idx = LinkIdx::new(network.len() as u32);
+            let vlink = create_virtual_link(&network[current_link_idx.idx()], virtual_link_idx);
+            initial_link_path.push(virtual_link_idx);
+
+            // Reverse so path goes: [virtual_link, prev_links...]
             initial_link_path.reverse();
+
+            // Build extended network with the virtual link patched in.
+            // We keep this around for the entire function so that the
+            // contiguity check in `extend_path_tpc` passes even when there are
+            // no real previous links between the virtual link and the first
+            // timed link.
+            let mut ext_net = network.to_vec();
+            ext_net[vlink.idx_next.idx()].idx_prev = vlink.idx_curr;
+            ext_net.push(vlink);
+            extended_network = Some(ext_net);
+        }
+
+        // Use extended network (with virtual link) when available, otherwise
+        // the original.  This is safe for the entire function because the only
+        // difference is the appended virtual link and one patched idx_prev on
+        // the link it connects to — all other links are identical.
+        let effective_network: &[Link] = match &extended_network {
+            Some(en) => en.as_slice(),
+            None => network,
+        };
+
+        // Extend path with backward context (virtual + previous links only).
+        // The first timed link is NOT included here — it will be extended in
+        // the main loop at idx_prev=0 so that its timing constraint from
+        // timed_path[0].time is preserved.
+        if !initial_link_path.is_empty() {
+            self.extend_path_tpc(effective_network, &initial_link_path)
+                .with_context(|| {
+                    format!(
+                        "{}\nExtending backward context (virtual + previous links)",
+                        format_dbg!()
+                    )
+                })?;
+
+            // Shift the train's starting offset to the end of the backward
+            // context — i.e. the beginning of the first timed link's position
+            // in the path.  This ensures the train never steps through the
+            // virtual/previous links and no phantom energy accumulates.
+            let backward_length = self.path_tpc.offset_end();
+            self.state
+                .offset
+                .update_unchecked(backward_length, || format_dbg!())?;
         }
 
         self.save_state(|| format_dbg!())?;
 
-        // If we have previous links to add, extend the path with them first
-        if !initial_link_path.is_empty() {
-            if let Some(ref vlink) = virtual_link {
-                // Create an extended network with the virtual link appended
-                let mut extended_network = network.to_vec();
-                // Update the connecting link's idx_prev to point to the virtual link
-                extended_network[vlink.idx_next.idx()].idx_prev = vlink.idx_curr;
-                extended_network.push(vlink.clone());
-                self.extend_path_tpc(&extended_network, &initial_link_path)
-                    .with_context(|| {
-                        format!(
-                            "{}\nExtending with virtual link for train length",
-                            format_dbg!()
-                        )
-                    })?;
-            } else {
-                self.extend_path_tpc(network, &initial_link_path)
-                    .with_context(|| {
-                        format!(
-                            "{}\nExtending with previous links for train length",
-                            format_dbg!()
-                        )
-                    })?;
-            }
-        }
-
+        // Main loop: extend each timed link and step until its time.
+        // idx_prev=0 handles the first timed link normally, preserving the
+        // original timing and energy behavior.
         let mut idx_prev = 0;
-        while idx_prev != timed_path.len() - 1 {
+        while idx_prev < timed_path.len() - 1 {
             let mut idx_next = idx_prev + 1;
             while idx_next + 1 < timed_path.len() - 1
                 && timed_path[idx_next].time < *self.state.time.get_fresh(|| format_dbg!())?
@@ -672,7 +735,7 @@ impl SpeedLimitTrainSim {
             }
             let time_extend = timed_path[idx_next - 1].time;
             self.extend_path_tpc(
-                network,
+                effective_network,
                 &timed_path[idx_prev..idx_next]
                     .iter()
                     .map(|x| x.link_idx)
@@ -743,7 +806,7 @@ impl SpeedLimitTrainSim {
         // this figures out when to start braking in advance of a speed limit
         // drop.  Takes into account air brake dynamics. I have not reviewed
         // this code, but that is my understanding.
-        let (speed_limit, speed_target) = self
+        let (speed_limit, mut speed_target) = self
             .braking_points
             .calc_speeds(
                 *self.state.offset.get_stale(|| format_dbg!())?,
@@ -751,6 +814,20 @@ impl SpeedLimitTrainSim {
                 self.fric_brake.ramp_up_time * self.fric_brake.ramp_up_coeff,
             )
             .with_context(|| format_dbg!())?;
+
+        // If the train is nearly stopped with speed_target == 0 (inside a
+        // braking zone) but has NOT yet reached the end of the path, override
+        // speed_target to the local speed_limit so the train can accelerate
+        // and continue.  Without this, speed_target == 0 + speed ≈ 0 produces
+        // f_applied ≈ res_net → zero net acceleration → permanent stall.
+        if speed_target == si::Velocity::ZERO
+            && *self.state.speed.get_stale(|| format_dbg!())? < uc::MPH * 0.1
+            && *self.state.offset.get_stale(|| format_dbg!())?
+                < self.path_tpc.offset_end() - 1000.0 * uc::FT
+        {
+            speed_target = speed_limit;
+        }
+
         self.state
             .speed_limit
             .update(speed_limit, || format_dbg!())?;
@@ -1203,6 +1280,66 @@ impl Step for SpeedLimitTrainSim {
             .solve_step()
             .with_context(|| format!("{}\ntime step: {}", loc(), i))?);
         self.save_state(|| format!("{}\n{}", loc(), format_dbg!()))?;
+
+        // --- Debug: hourly SOC print & 5-day simulation time limit ---
+        {
+            let time_val = *self.state.time.get_fresh(|| format_dbg!())?;
+            let dt_val = *self.state.dt.get_fresh(|| format_dbg!())?;
+            let time_s = time_val.get::<si::second>();
+            let dt_s = dt_val.get::<si::second>();
+
+            // Abort if simulation time exceeds 5 days
+            const MAX_SIM_TIME_S: f64 = 5.0 * 24.0 * 3600.0;
+            if time_s > MAX_SIM_TIME_S {
+                bail!(
+                    "[SLTS] Simulation exceeded 5-day time limit ({:.1} hours elapsed). Aborting.",
+                    time_s / 3600.0
+                );
+            }
+
+            // Print SOC once per simulated hour for locos with reversible
+            // energy storage (hybrid or battery-electric)
+            let hour_now = (time_s / 3600.0).floor() as i64;
+            let hour_prev = ((time_s - dt_s) / 3600.0).floor() as i64;
+            if hour_now > hour_prev {
+                let has_res = self
+                    .loco_con
+                    .loco_vec
+                    .iter()
+                    .any(|l| l.reversible_energy_storage().is_some());
+                if has_res {
+                    let link_idx = *self.state.link_idx_front.get_fresh(|| format_dbg!())?;
+                    let offset_m = self
+                        .state
+                        .offset
+                        .get_fresh(|| format_dbg!())?
+                        .get::<si::meter>();
+                    let offset_end_m = self.path_tpc.offset_end().get::<si::meter>();
+                    let speed = *self.state.speed.get_fresh(|| format_dbg!())?;
+                    let speed_mph = (speed / uc::MPH).get::<si::ratio>();
+                    print!(
+                        "[SLTS SOC] t={:.1}h link_idx={} offset={:.1}mi offset_end={:.1}mi speed={:.1}mph",
+                        time_s / 3600.0,
+                        link_idx,
+                        offset_m / 1609.344,
+                        offset_end_m / 1609.344,
+                        speed_mph,
+                    );
+                    for (idx, loco) in self.loco_con.loco_vec.iter().enumerate() {
+                        if let Some(res) = loco.reversible_energy_storage() {
+                            let soc = res
+                                .state
+                                .soc
+                                .get_unchecked(|| format_dbg!())?
+                                .get::<si::ratio>();
+                            print!("  loco[{}] SOC={:.4}", idx, soc);
+                        }
+                    }
+                    println!();
+                }
+            }
+        }
+
         Ok(())
     }
 }
