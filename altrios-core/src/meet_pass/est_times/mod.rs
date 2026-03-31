@@ -194,13 +194,13 @@ pub(crate) fn create_virtual_link(end_of_track_link: &Link, virtual_link_idx: Li
 ///   by its `idx_curr` field and update the connecting link's `idx_prev`.
 fn get_links_for_train_placement(
     origin_link_idx: LinkIdx,
+    head_dist_in_link: si::Length,
     train_length: si::Length,
     network: &[Link],
 ) -> anyhow::Result<(Vec<LinkIdx>, Option<Link>)> {
-    let origin_link = &network[origin_link_idx.idx()];
-
-    // If the train fits on the origin link alone, just return it
-    if origin_link.length >= train_length {
+    // If the available backward space on the origin link is enough to fit the
+    // entire train, just return the origin link.
+    if head_dist_in_link >= train_length {
         return Ok((vec![origin_link_idx], None));
     }
 
@@ -208,7 +208,7 @@ fn get_links_for_train_placement(
     let mut link_path = Vec::with_capacity(8);
     link_path.push(origin_link_idx);
 
-    let mut total_length = origin_link.length;
+    let mut total_length = head_dist_in_link;
     let mut current_link_idx = origin_link_idx;
 
     // Keep adding previous links until we have enough length
@@ -719,19 +719,35 @@ pub fn make_est_times<N: AsRef<[Link]>>(
 
     // -----------------------------------------------------------------------
     // Add origin estimated times:
-    // For each origin, we ensure offset=0, is_front_end=false, and a real link_idx.
-    // Then create two `EstTime` events: (Arrive + Clear) for the train's tail and head.
+    // For each origin, create two `EstTime` events (Arrive + Clear) representing
+    // the train's initial position.  Placement depends on `is_front_end`:
+    //
+    // * `is_front_end = true`  — HEAD placement: the head of the train is at
+    //   `(orig.link_idx, orig.offset)` from the start of the link.  The tail
+    //   extends backward into previous links (or a virtual link when no real
+    //   previous links are available).  The simulation's initial offset is
+    //   set to match the head's position in the extended path.
+    //
+    // * `is_front_end = false` — TAIL placement (original algorithm): the
+    //   reference point `(orig.link_idx, orig.offset)` is the tail of the
+    //   train.  The head extends forward by `train_length`.  The origin link
+    //   itself provides backward context; previous links are added when the
+    //   link's full length is still not enough to accommodate the train body.
     // -----------------------------------------------------------------------
     for orig in origs {
-        ensure!(
-            orig.offset == si::Length::ZERO,
-            "Origin offset must be zero!"
-        );
-        ensure!(
-            !orig.is_front_end,
-            "Origin must be relative to the tail end!"
-        );
         ensure!(orig.link_idx.is_real(), "Origin link idx must be real!");
+
+        let origin_link_length = network[orig.link_idx.idx()].length;
+
+        // Backward space available on the origin link:
+        //   HEAD mode — only the portion of the link behind the head (= orig.offset).
+        //   TAIL mode — the full link length (head extends forward; the entire
+        //               link provides backward context for braking physics).
+        let head_dist_in_link = if orig.is_front_end {
+            orig.offset
+        } else {
+            origin_link_length
+        };
 
         let mut est_alt = EstTime {
             time_to_next: time_depart,
@@ -740,7 +756,7 @@ pub fn make_est_times<N: AsRef<[Link]>>(
             ..Default::default()
         };
 
-        // Arrive event
+        // Arrive event — records where the train reference point is at departure.
         insert_est_time(
             &mut est_times,
             &mut est_alt,
@@ -757,7 +773,7 @@ pub fn make_est_times<N: AsRef<[Link]>>(
             },
         );
 
-        // Clear event
+        // Clear event — records when the tail passes the reference point.
         insert_est_time(
             &mut est_times,
             &mut est_alt,
@@ -783,11 +799,19 @@ pub fn make_est_times<N: AsRef<[Link]>>(
         saved_sims.push(SavedSim {
             train_sim: {
                 let mut train_sim = Box::new(speed_limit_train_sim.clone());
-                // Get the links needed to place the train (may include previous links if train is longer than origin link)
                 let train_length = *train_sim.state.length.get_fresh(|| format_dbg!())?;
+
+                // Collect the backward links needed for physics context /
+                // train-body placement.
                 let (link_path, virtual_link) =
-                    get_links_for_train_placement(orig.link_idx, train_length, network)
-                        .with_context(|| format_dbg!())?;
+                    get_links_for_train_placement(
+                        orig.link_idx,
+                        head_dist_in_link,
+                        train_length,
+                        network,
+                    )
+                    .with_context(|| format_dbg!())?;
+
                 if let Some(vlink) = virtual_link {
                     // Create an extended network with the virtual link appended
                     let mut extended_network = network.to_vec();
@@ -802,6 +826,25 @@ pub fn make_est_times<N: AsRef<[Link]>>(
                         .extend_path_tpc(network, &link_path)
                         .with_context(|| format_dbg!())?;
                 }
+
+                // HEAD-end placement: set the train's initial path offset so
+                // the simulation starts with its head exactly at orig.offset
+                // within the origin link.  TAIL-end placement uses the default
+                // initial offset (= train_length, set by TrainState::new),
+                // which correctly places the head train_length ahead of the
+                // tail at orig.offset from the beginning of the path.
+                if orig.is_front_end {
+                    let path_end = train_sim.path_tpc.offset_end();
+                    let head_pos = path_end - origin_link_length + orig.offset;
+                    train_sim
+                        .state
+                        .offset
+                        .update_unchecked(head_pos, || format_dbg!())?;
+                    train_sim
+                        .recalc_braking_points()
+                        .with_context(|| format_dbg!())?;
+                }
+
                 train_sim
             },
             join_paths: vec![],
@@ -1086,6 +1129,7 @@ mod test_train_placement {
 
     /// Test case 1: get_links_for_train_placement returns single link when train fits
     /// Link 71 (Minneapolis origin) is ~2682m, train is 1800m - should return just the origin link.
+    /// Uses TAIL-end placement (is_front_end=false): head_dist_in_link = link.length.
     #[test]
     fn test_get_links_for_train_placement_fits_on_single_link() {
         let resources = get_resources_path();
@@ -1097,8 +1141,11 @@ mod test_train_placement {
 
         let origin_link_idx = LinkIdx::new(71); // Minneapolis
         let train_length = 1800.0 * uc::M; // 100 cars * 18m
+        // TAIL-end: the full link length is the available backward space
+        let head_dist_in_link = links[origin_link_idx.idx()].length;
 
-        let result = get_links_for_train_placement(origin_link_idx, train_length, links);
+        let result =
+            get_links_for_train_placement(origin_link_idx, head_dist_in_link, train_length, links);
 
         assert!(
             result.is_ok(),
@@ -1116,6 +1163,7 @@ mod test_train_placement {
     /// Test case 2: Train longer than initial link with no previous links available
     /// Link 71 (Minneapolis origin) has idx_prev: 0, so a train longer than 2682m should
     /// produce a virtual link to accommodate the train.
+    /// Uses TAIL-end placement (is_front_end=false): head_dist_in_link = link.length.
     #[test]
     fn test_get_links_for_train_placement_too_long_no_previous() {
         let resources = get_resources_path();
@@ -1127,8 +1175,11 @@ mod test_train_placement {
 
         let origin_link_idx = LinkIdx::new(71); // Minneapolis
         let train_length = 3000.0 * uc::M; // Longer than the ~2682m link
+        // TAIL-end: the full link length is the available backward space
+        let head_dist_in_link = links[origin_link_idx.idx()].length;
 
-        let result = get_links_for_train_placement(origin_link_idx, train_length, links);
+        let result =
+            get_links_for_train_placement(origin_link_idx, head_dist_in_link, train_length, links);
 
         assert!(
             result.is_ok(),
@@ -1189,6 +1240,7 @@ mod test_train_placement {
     /// Test case 3: Very long train (500 cars = 9000m)
     /// Should succeed by creating a virtual link since the virtual link is 5 miles (~8047m)
     /// which combined with the origin link provides enough length.
+    /// Uses TAIL-end placement (is_front_end=false): head_dist_in_link = link.length.
     #[test]
     fn test_get_links_for_train_placement_500_cars() {
         let resources = get_resources_path();
@@ -1200,8 +1252,11 @@ mod test_train_placement {
 
         let origin_link_idx = LinkIdx::new(71); // Minneapolis
         let train_length = 9000.0 * uc::M; // 500 cars * 18m
+        // TAIL-end: the full link length is the available backward space
+        let head_dist_in_link = links[origin_link_idx.idx()].length;
 
-        let result = get_links_for_train_placement(origin_link_idx, train_length, links);
+        let result =
+            get_links_for_train_placement(origin_link_idx, head_dist_in_link, train_length, links);
 
         assert!(
             result.is_ok(),
@@ -1241,6 +1296,7 @@ mod test_train_placement {
 
     /// Test case 4: Train that needs previous links should collect them correctly
     /// Find a link in the network that has previous links and test that it collects them.
+    /// Uses TAIL-end placement (is_front_end=false): head_dist_in_link = link.length.
     #[test]
     fn test_get_links_for_train_placement_uses_previous_links() {
         let resources = get_resources_path();
@@ -1263,8 +1319,11 @@ mod test_train_placement {
 
         // Create a train that's longer than link 70 but shorter than link 70 + its previous links
         let train_length = origin_link.length + 100.0 * uc::M;
+        // TAIL-end: the full link length is the available backward space
+        let head_dist_in_link = origin_link.length;
 
-        let result = get_links_for_train_placement(origin_link_idx, train_length, links);
+        let result =
+            get_links_for_train_placement(origin_link_idx, head_dist_in_link, train_length, links);
 
         // If the previous links have enough length, this should succeed and return multiple links
         if result.is_ok() {
@@ -1287,5 +1346,72 @@ mod test_train_placement {
                 err_msg
             );
         }
+    }
+
+    /// Test case 5 (HEAD-end): head_dist_in_link = 0 always needs a virtual / previous link.
+    /// Even if the origin link is very long, a zero offset means nothing is behind the head,
+    /// so the full train_length must be accommodated by backward links.
+    #[test]
+    fn test_get_links_for_train_placement_head_end_zero_offset() {
+        let resources = get_resources_path();
+
+        let network = Network::from_file(resources.join("networks/Taconite-NoBalloon.yaml"), false)
+            .expect("Failed to load network");
+        let links = &network.1;
+
+        let origin_link_idx = LinkIdx::new(71); // Minneapolis (no idx_prev)
+        let train_length = 1800.0 * uc::M;
+        // HEAD-end at offset 0 means zero backward space on origin link → virtual always needed
+        let head_dist_in_link = si::Length::ZERO;
+
+        let result =
+            get_links_for_train_placement(origin_link_idx, head_dist_in_link, train_length, links);
+
+        assert!(result.is_ok(), "Should succeed by creating a virtual link");
+        let (link_path, virtual_link) = result.unwrap();
+        assert!(
+            virtual_link.is_some(),
+            "Should need a virtual link when head_dist_in_link = 0"
+        );
+        // Path: [virtual, origin]
+        assert_eq!(link_path.len(), 2, "Should return [virtual, origin]");
+        assert_eq!(
+            link_path[0],
+            LinkIdx::new(links.len() as u32),
+            "First element should be the virtual link"
+        );
+        assert_eq!(
+            link_path[1], origin_link_idx,
+            "Second element should be the origin link"
+        );
+    }
+
+    /// Test case 6 (HEAD-end): head_dist_in_link = partial offset fits the train.
+    /// With head at 2000m in a link, 2000m of backward space is available, so a
+    /// 1800m train fits on the origin link alone.
+    #[test]
+    fn test_get_links_for_train_placement_head_end_partial_offset() {
+        let resources = get_resources_path();
+
+        let network = Network::from_file(resources.join("networks/Taconite-NoBalloon.yaml"), false)
+            .expect("Failed to load network");
+        let links = &network.1;
+
+        let origin_link_idx = LinkIdx::new(71); // Minneapolis
+        let train_length = 1800.0 * uc::M;
+        // HEAD-end at 2000m into the link → 2000m of backward space > 1800m train
+        let head_dist_in_link = 2000.0 * uc::M;
+
+        let result =
+            get_links_for_train_placement(origin_link_idx, head_dist_in_link, train_length, links);
+
+        assert!(result.is_ok(), "Should succeed");
+        let (link_path, virtual_link) = result.unwrap();
+        assert!(
+            virtual_link.is_none(),
+            "Should NOT need a virtual link when offset > train_length"
+        );
+        assert_eq!(link_path.len(), 1, "Should return just the origin link");
+        assert_eq!(link_path[0], origin_link_idx);
     }
 }

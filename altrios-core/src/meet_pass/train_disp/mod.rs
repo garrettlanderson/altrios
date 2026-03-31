@@ -290,4 +290,91 @@ mod test_train_disp {
         )
         .unwrap();
     }
+
+    /// Test that make_est_times works correctly with HEAD-end placement
+    /// (is_front_end = true, offset = 0).  The head is placed at the start of
+    /// the origin link and the tail extends backward into a virtual link.
+    #[test]
+    fn test_make_train_fwd_head_end() {
+        let network_file_path = project_root::get_project_root()
+            .unwrap()
+            .join("python/altrios/resources/networks/Taconite.yaml");
+        let network = {
+            let network = Network::from_file(network_file_path, false);
+            if let Err(err) = &network {
+                panic!("{err}");
+            }
+            network
+        }
+        .unwrap();
+
+        let mut speed_limit_train_sim = crate::train::speed_limit_train_sim_fwd();
+        // Switch both origins to HEAD-end placement at offset 0
+        for orig in speed_limit_train_sim.origs.iter_mut() {
+            orig.is_front_end = true;
+            orig.offset = crate::si::Length::ZERO;
+        }
+
+        let est_times = make_est_times(speed_limit_train_sim.clone(), network, None)
+            .unwrap()
+            .0;
+        TrainDisp::new(
+            speed_limit_train_sim.train_id.clone(),
+            NonZeroU16::new(1),
+            *speed_limit_train_sim
+                .state
+                .time
+                .get_fresh(|| format_dbg!())
+                .unwrap(),
+            8.0 * uc::MIN,
+            30.0 * uc::MI,
+            10.0 * uc::MI,
+            0.5 * uc::MPH / uc::S,
+            est_times,
+        )
+        .unwrap();
+    }
+
+    /// Test that make_est_times works with HEAD-end placement at a non-zero offset.
+    /// The head is 1000 m into the origin link and the tail extends backward.
+    #[test]
+    fn test_make_train_fwd_head_end_nonzero_offset() {
+        let network_file_path = project_root::get_project_root()
+            .unwrap()
+            .join("python/altrios/resources/networks/Taconite.yaml");
+        let network = {
+            let network = Network::from_file(network_file_path, false);
+            if let Err(err) = &network {
+                panic!("{err}");
+            }
+            network
+        }
+        .unwrap();
+
+        let mut speed_limit_train_sim = crate::train::speed_limit_train_sim_fwd();
+        // HEAD-end at 1000 m into the origin link
+        for orig in speed_limit_train_sim.origs.iter_mut() {
+            orig.is_front_end = true;
+            orig.offset = 1000.0 * crate::uc::M;
+        }
+
+        let est_times = make_est_times(speed_limit_train_sim.clone(), network, None)
+            .unwrap()
+            .0;
+        TrainDisp::new(
+            speed_limit_train_sim.train_id.clone(),
+            NonZeroU16::new(1),
+            *speed_limit_train_sim
+                .state
+                .time
+                .get_fresh(|| format_dbg!())
+                .unwrap(),
+            8.0 * uc::MIN,
+            30.0 * uc::MI,
+            10.0 * uc::MI,
+            0.5 * uc::MPH / uc::S,
+            est_times,
+        )
+        .unwrap();
+    }
 }

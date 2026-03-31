@@ -1204,7 +1204,7 @@ impl SpeedLimitTrainSim {
         Ok(())
     }
 
-    fn recalc_braking_points(&mut self) -> anyhow::Result<()> {
+    pub fn recalc_braking_points(&mut self) -> anyhow::Result<()> {
         self.braking_points
             .recalc(
                 &self.state,
