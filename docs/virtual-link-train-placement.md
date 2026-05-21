@@ -58,6 +58,20 @@ After (virtual link):
   [virtual_link (5 mi, 70 mph)] → [origin_link] → [rest of path...]
 ```
 
+## Where Is the Train Placed?
+
+The `Origin` (`SetSpeedTrainSim`/`SpeedLimitTrainSim` initial location) is defined relative to the **tail** of the train (`is_front_end == false`) at `offset == 0` of the origin link. The `get_links_for_train_placement` algorithm always treats the **origin link as the link the head of the train currently occupies the end of**, and only ever walks **backwards** through `idx_prev` to find more track to put the tail on.
+
+This means that in all three cases the **head of the train is placed at the end of the origin link**:
+
+| Case | Head position | Tail position |
+|---|---|---|
+| 1. Train fits on origin link | End of origin link | Somewhere inside the origin link, at `origin_link.length - train_length` from the start of the origin link |
+| 2. Train longer than origin link, previous links exist | End of origin link | Inside one of the prepended previous links, `train_length - origin_link.length` (etc.) behind the start of the origin link |
+| 3. Train longer than origin link, no previous links (virtual-link case) | End of origin link | Inside the 5 mi virtual link, `train_length - origin_link.length` behind the start of the origin link |
+
+The origin link itself is never modified — the head's position at the end of the origin link is what defines where the simulation starts. Everything prepended (real previous links or the virtual link) exists purely so that the tail has somewhere physical to sit when the train is longer than the origin link.
+
 When the caller receives `Some(virtual_link)`:
 1. Clone the network into a temporary `Vec<Link>`
 2. Set `extended_network[connecting_link].idx_prev = virtual_link.idx_curr`
