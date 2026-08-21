@@ -1,0 +1,6 @@
+# Pinned so deploys don't silently pick up a new stable that breaks a dependency
+# (rustc 1.98 broke ethnum 1.5.2). MSRV is 1.83; see workspace Cargo.toml.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
