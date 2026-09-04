@@ -2,7 +2,7 @@
 
 use super::disp_imports::*;
 use crate::consist::Consist;
-use crate::track::Network;
+use crate::track::{Elev, Heading, Network, SpeedLimit, SpeedSet};
 use uc::SPEED_DIFF_JOIN;
 use uc::TIME_NAN;
 
@@ -97,6 +97,152 @@ pub fn check_od_pair_valid(
     } else {
         Ok(())
     }
+}
+
+/// Creates a virtual link that extends the track when there aren't enough
+/// previous links to place a train. The virtual link has:
+/// - Same heading and elevation as the link at the end of the track
+/// - Speed restriction of 70 mph for the entire link
+/// - Length of 5 miles
+///
+/// # Arguments
+/// * `end_of_track_link` - The link at the end of the track (the one with no more previous links)
+/// * `virtual_link_idx` - The index to assign to the virtual link (typically `network.len()`)
+pub(crate) fn create_virtual_link(end_of_track_link: &Link, virtual_link_idx: LinkIdx) -> Link {
+    let length = 5.0 * uc::MI;
+
+    // Use the same elevation as the beginning of the end-of-track link (flat virtual link)
+    let end_elev = if !end_of_track_link.elevs.is_empty() {
+        end_of_track_link.elevs.first().unwrap().elev
+    } else {
+        si::Length::ZERO
+    };
+    let elevs = vec![
+        Elev::new(si::Length::ZERO, end_elev),
+        Elev::new(length, end_elev),
+    ];
+
+    // Use the same heading as the beginning of the end-of-track link
+    let headings = if !end_of_track_link.headings.is_empty() {
+        let end_heading = end_of_track_link.headings.first().unwrap().heading;
+        vec![
+            Heading {
+                offset: si::Length::ZERO,
+                heading: end_heading,
+                lat: None,
+                lon: None,
+            },
+            Heading {
+                offset: length,
+                heading: end_heading,
+                lat: None,
+                lon: None,
+            },
+        ]
+    } else {
+        vec![]
+    };
+
+    // Speed set with 70 mph limit for the entire link
+    let speed_set = SpeedSet {
+        speed_limits: vec![SpeedLimit {
+            offset_start: si::Length::ZERO,
+            offset_end: length,
+            speed: 70.0 * uc::MPH,
+        }],
+        speed_params: vec![],
+        is_head_end: false,
+    };
+
+    Link {
+        idx_curr: virtual_link_idx,
+        idx_flip: LinkIdx::default(),
+        idx_next: end_of_track_link.idx_curr,
+        idx_next_alt: LinkIdx::default(),
+        idx_prev: LinkIdx::default(),
+        idx_prev_alt: LinkIdx::default(),
+        length,
+        elevs,
+        headings,
+        speed_sets: HashMap::new(),
+        speed_set: Some(speed_set),
+        cat_power_limits: vec![],
+        link_idxs_lockout: vec![],
+        osm_id: None,
+        err_tol: None,
+    }
+}
+
+/// Collect previous links needed to accommodate train length when placing train at origin.
+///
+/// When a train is placed at an origin link, the back of the train may extend beyond
+/// the beginning of that link. This function collects previous links until there is
+/// enough total length to contain the entire train. If there are not enough previous
+/// links, a virtual link is created to provide the remaining length.
+///
+/// # Arguments
+/// * `origin_link_idx` - The link where the train's front will be placed
+/// * `train_length` - The total length of the train
+/// * `network` - The network of links
+///
+/// # Returns
+/// A tuple of:
+/// - A vector of link indices starting from the furthest previous link and ending with
+///   the origin link, ordered so the train can be placed with its front at the origin.
+/// - An optional virtual link that was created if there weren't enough previous links.
+///   When present, the caller must add this link to the network at the index specified
+///   by its `idx_curr` field and update the connecting link's `idx_prev`.
+fn get_links_for_train_placement(
+    origin_link_idx: LinkIdx,
+    train_length: si::Length,
+    network: &[Link],
+) -> anyhow::Result<(Vec<LinkIdx>, Option<Link>)> {
+    let origin_link = &network[origin_link_idx.idx()];
+
+    // If the train fits on the origin link alone, just return it
+    if origin_link.length >= train_length {
+        return Ok((vec![origin_link_idx], None));
+    }
+
+    // We need to collect previous links to accommodate the train
+    let mut link_path = Vec::with_capacity(8);
+    link_path.push(origin_link_idx);
+
+    let mut total_length = origin_link.length;
+    let mut current_link_idx = origin_link_idx;
+
+    // Keep adding previous links until we have enough length
+    while total_length < train_length {
+        let current_link = &network[current_link_idx.idx()];
+
+        // Get the previous link (prefer idx_prev over idx_prev_alt)
+        let prev_link_idx = if current_link.idx_prev.is_real() {
+            current_link.idx_prev
+        } else if current_link.idx_prev_alt.is_real() {
+            current_link.idx_prev_alt
+        } else {
+            // No more previous links available -- create a virtual link
+            let virtual_link_idx = LinkIdx::new(network.len() as u32);
+            let virtual_link =
+                create_virtual_link(&network[current_link_idx.idx()], virtual_link_idx);
+            total_length += virtual_link.length;
+            link_path.push(virtual_link_idx);
+
+            // Reverse the path so it goes from virtual link -> previous links -> origin
+            link_path.reverse();
+            return Ok((link_path, Some(virtual_link)));
+        };
+
+        let prev_link = &network[prev_link_idx.idx()];
+        total_length += prev_link.length;
+        link_path.push(prev_link_idx);
+        current_link_idx = prev_link_idx;
+    }
+
+    // Reverse the path so it goes from previous links to origin
+    link_path.reverse();
+
+    Ok((link_path, None))
 }
 
 /// Get link indexes that lead to the destination (CURRENTLY ALLOWS LOOPS THAT
@@ -514,11 +660,11 @@ fn add_new_join_paths(
 /// # Arguments
 ///
 /// * `speed_limit_train_sim` - `SpeedLimitTrainSim` is an instance of
-///    train simulation in which speed is allowed to vary according to train
-///    capabilities and speed limit.
+///   train simulation in which speed is allowed to vary according to train
+///   capabilities and speed limit.
 /// * `network` - Network comprises an ensemble of links (path between junctions
-///    along the rail with heading, grade, and location) this simulation
-///    operates on.
+///   along the rail with heading, grade, and location) this simulation
+///   operates on.
 /// * `path_for_failed_sim` - if provided, saves failed `speed_limit_train_sim` at Path
 ///
 /// # Returns
@@ -637,9 +783,25 @@ pub fn make_est_times<N: AsRef<[Link]>>(
         saved_sims.push(SavedSim {
             train_sim: {
                 let mut train_sim = Box::new(speed_limit_train_sim.clone());
-                train_sim
-                    .extend_path_tpc(network, &[orig.link_idx])
-                    .with_context(|| format_dbg!())?;
+                // Get the links needed to place the train (may include previous links if train is longer than origin link)
+                let train_length = *train_sim.state.length.get_fresh(|| format_dbg!())?;
+                let (link_path, virtual_link) =
+                    get_links_for_train_placement(orig.link_idx, train_length, network)
+                        .with_context(|| format_dbg!())?;
+                if let Some(vlink) = virtual_link {
+                    // Create an extended network with the virtual link appended
+                    let mut extended_network = network.to_vec();
+                    // Update the connecting link's idx_prev to point to the virtual link
+                    extended_network[vlink.idx_next.idx()].idx_prev = vlink.idx_curr;
+                    extended_network.push(vlink);
+                    train_sim
+                        .extend_path_tpc(&extended_network, &link_path)
+                        .with_context(|| format_dbg!())?;
+                } else {
+                    train_sim
+                        .extend_path_tpc(network, &link_path)
+                        .with_context(|| format_dbg!())?;
+                }
                 train_sim
             },
             join_paths: vec![],
@@ -908,4 +1070,222 @@ pub fn make_est_times_py(
     };
 
     make_est_times(speed_limit_train_sim, network, path_for_failed_sim)
+}
+
+#[cfg(test)]
+mod test_train_placement {
+    use super::*;
+    use crate::track::link::network::Network;
+
+    /// Helper function to get the project resources path
+    fn get_resources_path() -> PathBuf {
+        project_root::get_project_root()
+            .unwrap()
+            .join("python/altrios/resources")
+    }
+
+    /// Test case 1: get_links_for_train_placement returns single link when train fits
+    /// Link 71 (Minneapolis origin) is ~2682m, train is 1800m - should return just the origin link.
+    #[test]
+    fn test_get_links_for_train_placement_fits_on_single_link() {
+        let resources = get_resources_path();
+
+        // Load network
+        let network = Network::from_file(resources.join("networks/Taconite-NoBalloon.yaml"), false)
+            .expect("Failed to load network");
+        let links = &network.1; // Get the Vec<Link> from the Network tuple
+
+        let origin_link_idx = LinkIdx::new(71); // Minneapolis
+        let train_length = 1800.0 * uc::M; // 100 cars * 18m
+
+        let result = get_links_for_train_placement(origin_link_idx, train_length, links);
+
+        assert!(
+            result.is_ok(),
+            "Should succeed when train fits on origin link"
+        );
+        let (link_path, virtual_link) = result.unwrap();
+        assert!(virtual_link.is_none(), "Should not need a virtual link");
+        assert_eq!(link_path.len(), 1, "Should return just the origin link");
+        assert_eq!(
+            link_path[0], origin_link_idx,
+            "Should return the origin link"
+        );
+    }
+
+    /// Test case 2: Train longer than initial link with no previous links available
+    /// Link 71 (Minneapolis origin) has idx_prev: 0, so a train longer than 2682m should
+    /// produce a virtual link to accommodate the train.
+    #[test]
+    fn test_get_links_for_train_placement_too_long_no_previous() {
+        let resources = get_resources_path();
+
+        // Load network
+        let network = Network::from_file(resources.join("networks/Taconite-NoBalloon.yaml"), false)
+            .expect("Failed to load network");
+        let links = &network.1;
+
+        let origin_link_idx = LinkIdx::new(71); // Minneapolis
+        let train_length = 3000.0 * uc::M; // Longer than the ~2682m link
+
+        let result = get_links_for_train_placement(origin_link_idx, train_length, links);
+
+        assert!(
+            result.is_ok(),
+            "Should succeed by creating a virtual link when no previous links available"
+        );
+        let (link_path, virtual_link) = result.unwrap();
+        assert!(virtual_link.is_some(), "Should have created a virtual link");
+        let vlink = virtual_link.unwrap();
+
+        // Verify virtual link properties
+        assert_eq!(
+            vlink.idx_curr,
+            LinkIdx::new(links.len() as u32),
+            "Virtual link should have idx_curr = network.len()"
+        );
+        assert_eq!(
+            vlink.idx_next, origin_link_idx,
+            "Virtual link's idx_next should point to the origin link"
+        );
+        assert!(
+            (vlink.length.get::<si::meter>() - (5.0 * uc::MI).get::<si::meter>()).abs() < 1.0,
+            "Virtual link should be 5 miles long, got: {} m",
+            vlink.length.get::<si::meter>()
+        );
+
+        // Verify speed limit is 70 mph
+        let speed_set = vlink
+            .speed_set
+            .as_ref()
+            .expect("Virtual link should have a speed_set");
+        assert_eq!(
+            speed_set.speed_limits.len(),
+            1,
+            "Should have exactly one speed limit"
+        );
+        assert!(
+            (speed_set.speed_limits[0].speed - 70.0 * uc::MPH).abs() < 0.01 * uc::MPS,
+            "Speed limit should be 70 mph"
+        );
+
+        // Verify the link path includes the virtual link first and origin last
+        assert!(
+            link_path.len() >= 2,
+            "Should return at least 2 links (virtual + origin)"
+        );
+        assert_eq!(
+            link_path[0],
+            LinkIdx::new(links.len() as u32),
+            "First link should be the virtual link"
+        );
+        assert_eq!(
+            *link_path.last().unwrap(),
+            origin_link_idx,
+            "Last link should be the origin"
+        );
+    }
+
+    /// Test case 3: Very long train (500 cars = 9000m)
+    /// Should succeed by creating a virtual link since the virtual link is 5 miles (~8047m)
+    /// which combined with the origin link provides enough length.
+    #[test]
+    fn test_get_links_for_train_placement_500_cars() {
+        let resources = get_resources_path();
+
+        // Load network
+        let network = Network::from_file(resources.join("networks/Taconite-NoBalloon.yaml"), false)
+            .expect("Failed to load network");
+        let links = &network.1;
+
+        let origin_link_idx = LinkIdx::new(71); // Minneapolis
+        let train_length = 9000.0 * uc::M; // 500 cars * 18m
+
+        let result = get_links_for_train_placement(origin_link_idx, train_length, links);
+
+        assert!(
+            result.is_ok(),
+            "500-car train should succeed with virtual link (5 mi + origin link > 9000m)"
+        );
+        let (link_path, virtual_link) = result.unwrap();
+        assert!(
+            virtual_link.is_some(),
+            "Should have created a virtual link for 500-car train"
+        );
+        let vlink = virtual_link.unwrap();
+
+        // Verify that virtual link + origin link provides enough length
+        let origin_link = &links[origin_link_idx.idx()];
+        let total_length = vlink.length + origin_link.length;
+        assert!(
+            total_length >= train_length,
+            "Virtual link ({:.0} m) + origin link ({:.0} m) = {:.0} m should be >= train length ({:.0} m)",
+            vlink.length.get::<si::meter>(),
+            origin_link.length.get::<si::meter>(),
+            total_length.get::<si::meter>(),
+            train_length.get::<si::meter>()
+        );
+
+        // Verify link path structure
+        assert_eq!(
+            link_path[0],
+            LinkIdx::new(links.len() as u32),
+            "First link should be the virtual link"
+        );
+        assert_eq!(
+            *link_path.last().unwrap(),
+            origin_link_idx,
+            "Last link should be the origin"
+        );
+    }
+
+    /// Test case 4: Train that needs previous links should collect them correctly
+    /// Find a link in the network that has previous links and test that it collects them.
+    #[test]
+    fn test_get_links_for_train_placement_uses_previous_links() {
+        let resources = get_resources_path();
+
+        // Load network
+        let network = Network::from_file(resources.join("networks/Taconite-NoBalloon.yaml"), false)
+            .expect("Failed to load network");
+        let links = &network.1;
+
+        // Link 70 has idx_prev: 71 (based on the network structure)
+        // Let's check if we can find a link with previous links
+        let origin_link_idx = LinkIdx::new(70);
+        let origin_link = &links[origin_link_idx.idx()];
+
+        // Skip this test if link 70 doesn't have a valid previous link
+        if !origin_link.idx_prev.is_real() {
+            println!("Skipping test: Link 70 has no previous links");
+            return;
+        }
+
+        // Create a train that's longer than link 70 but shorter than link 70 + its previous links
+        let train_length = origin_link.length + 100.0 * uc::M;
+
+        let result = get_links_for_train_placement(origin_link_idx, train_length, links);
+
+        // If the previous links have enough length, this should succeed and return multiple links
+        if result.is_ok() {
+            let (link_path, _virtual_link) = result.unwrap();
+            assert!(
+                link_path.len() >= 2,
+                "Should return at least 2 links when train is longer than origin"
+            );
+            assert_eq!(
+                *link_path.last().unwrap(),
+                origin_link_idx,
+                "Last link should be origin"
+            );
+        } else {
+            // If it fails, it should be because of insufficient track length
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("Train too long"),
+                "If it fails, error should mention 'Train too long', got: {}",
+                err_msg
+            );
+        }
+    }
 }
