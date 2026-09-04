@@ -16,7 +16,9 @@ use crate::track::link::network::Network;
 use crate::track::LocationMap;
 
 use polars::prelude::*;
-use polars_lazy::dsl::max_horizontal;
+// Import through `dsl::functions` (rather than `dsl`) so the name is not an
+// ambiguous glob re-export, which newer rustc rejects.
+use polars_lazy::dsl::functions::max_horizontal;
 #[allow(unused_imports)]
 use polars_lazy::prelude::*;
 use pyo3_polars::PyDataFrame;
